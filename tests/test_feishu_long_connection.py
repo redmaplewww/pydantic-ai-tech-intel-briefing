@@ -14,7 +14,7 @@ from search_assistant.feishu.long_connection import (
     _redact_log_message,
 )
 from search_assistant.memory.store import MemoryStore
-from search_assistant.workflow.runtime import FakeAgentRuntime
+from search_assistant.runtime import FakeAgentRuntime
 from search_assistant.workflow.service import SearchAssistantWorkflow
 
 

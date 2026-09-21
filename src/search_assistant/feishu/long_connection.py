@@ -19,7 +19,8 @@ from search_assistant.feishu.formatting import package_to_plain_text, reply_answ
 from search_assistant.memory.store import MemoryStore
 from search_assistant.profile.service import ProfileService
 from search_assistant.search.provider import SearchClient, search_client_from_settings
-from search_assistant.workflow.runtime import AgentRuntime, runtime_from_settings
+from search_assistant.runtime import AgentRuntime
+from search_assistant.runtime.pydantic_ai import runtime_from_settings
 from search_assistant.workflow.service import SearchAssistantWorkflow
 
 

@@ -1,5 +1,10 @@
 # Search Assistant MVP Implementation Plan
 
+> Historical / Superseded: this June 2026 MVP plan is preserved for
+> traceability, including its Microsoft Agent Framework assumptions. It is not
+> the current runtime architecture. See
+> `docs/adr/0001-pydantic-ai-primary-runtime.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the Phase 1 Feishu-connected search assistant MVP described in `docs/superpowers/specs/2026-06-26-search-assistant-design.md`.

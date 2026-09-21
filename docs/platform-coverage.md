@@ -21,6 +21,20 @@ to a guaranteed search result, and no route bypasses platform access controls.
 | Xiaohongshu | Baidu public-index query | None | Original target URL only, no note fetch. |
 | LinkedIn, X, Reddit, YouTube | Public result-page discovery | None | Public pages only; no internal platform search. |
 
+## Source Capability Contracts
+
+The code keeps a local registry for supported source families.  Each contract
+records aliases, hostnames, provider families, allowed read-only actions,
+unsupported actions such as login/write/private-feed access, and a default
+search-budget weight.  This makes source coverage auditable without adding any
+new private automation route.
+
+Useful local checks:
+
+- `search-assistant source-contracts`
+- `search-assistant topic-recipe-show "<topic>"`
+- `search-assistant topic-recipe-set "<topic>" '{"general-web": 3, "bilibili": 1}'`
+
 ## Disabled Or Conditional Routes
 
 | Platform | Status | Reason |

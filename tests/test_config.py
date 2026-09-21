@@ -16,6 +16,10 @@ def test_settings_loads_defaults_for_local_mode(tmp_path):
     assert settings.search_provider == "hybrid"
     assert settings.mcp_search_config_path is None
     assert settings.mcp_search_timeout_seconds == 18.0
+    assert settings.agent_reach_enabled is False
+    assert settings.agent_reach_command == "agent-reach"
+    assert settings.agent_reach_timeout_seconds == 30.0
+    assert settings.agent_reach_doctor_cache_seconds == 300.0
     assert settings.domestic_rss_base_url == "http://127.0.0.1:1200"
     assert settings.domestic_rss_config_path is None
     assert settings.domestic_rss_timeout_seconds == 8.0
@@ -24,7 +28,9 @@ def test_settings_loads_defaults_for_local_mode(tmp_path):
     assert settings.briefing_max_queries == 28
     assert settings.bilibili_search_base_url == "https://api.bilibili.com/x/web-interface/search/type"
     assert settings.duckduckgo_timeout_seconds == 12.0
-    assert settings.baidu_search_base_url == "https://m.baidu.com/s"
+    assert settings.browser_search_engines == ["bing", "baidu", "google"]
+    assert settings.browser_search_base_url == "https://cn.bing.com/search"
+    assert settings.baidu_search_base_url == "https://www.baidu.com/baidu"
 
 
 def test_settings_loads_domestic_rss_configuration(tmp_path):
@@ -42,6 +48,25 @@ def test_settings_loads_domestic_rss_configuration(tmp_path):
     assert settings.domestic_rss_base_url == "http://rsshub.test:1200"
     assert settings.domestic_rss_config_path == catalog_path
     assert settings.domestic_rss_timeout_seconds == 11.0
+
+
+def test_settings_loads_agent_reach_configuration(tmp_path):
+    settings = Settings.from_env(
+        {
+            "SEARCH_ASSISTANT_DATA_DIR": str(tmp_path),
+            "SEARCH_ASSISTANT_SEARCH_PROVIDER": "agent-reach",
+            "SEARCH_ASSISTANT_AGENT_REACH_ENABLED": "true",
+            "AGENT_REACH_COMMAND": "agent-reach-custom",
+            "AGENT_REACH_TIMEOUT_SECONDS": "17",
+            "AGENT_REACH_DOCTOR_CACHE_SECONDS": "31",
+        }
+    )
+
+    assert settings.search_provider == "agent-reach"
+    assert settings.agent_reach_enabled is True
+    assert settings.agent_reach_command == "agent-reach-custom"
+    assert settings.agent_reach_timeout_seconds == 17.0
+    assert settings.agent_reach_doctor_cache_seconds == 31.0
 
 
 def test_settings_loads_env_local_when_no_mapping_is_provided(monkeypatch, tmp_path):

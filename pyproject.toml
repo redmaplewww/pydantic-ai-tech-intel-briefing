@@ -7,12 +7,11 @@ license = {text = "MIT"}
 requires-python = ">=3.11,<3.14"
 authors = [{name = "redmaplewww"}]
 dependencies = [
-  "agent-framework==1.9.0",
-  "agent-framework-openai==1.8.2",
   "fastapi==0.138.1",
   "lark-oapi==1.6.8",
+  "openai==2.53.0",
   "pydantic==2.13.4",
-  "pydantic-ai-slim[openai,mcp]>=1.0,<2.0",
+  "pydantic-ai-slim[openai,mcp]==1.107.1",
   "uvicorn==0.38.0",
 ]
 
@@ -20,6 +19,9 @@ dependencies = [
 dev = [
   "pytest==9.0.2",
   "httpx==0.28.1",
+]
+agent-reach = [
+  "agent-reach @ https://github.com/Panniantong/agent-reach/archive/main.zip",
 ]
 
 [project.urls]

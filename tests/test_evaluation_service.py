@@ -4,7 +4,7 @@ from search_assistant.contracts import AnswerPackage, SearchRecord, SourceEviden
 from search_assistant.evaluation.service import DEFAULT_EVALUATION_QUESTIONS, EvaluationService, _evaluation_item
 from search_assistant.memory.store import MemoryStore
 from search_assistant.search.provider import SearchResult
-from search_assistant.workflow.runtime import FakeAgentRuntime
+from search_assistant.runtime import FakeAgentRuntime
 from search_assistant.workflow.service import SearchAssistantWorkflow
 
 
@@ -51,6 +51,13 @@ def test_evaluation_suite_runs_multiple_questions_and_writes_report(tmp_path):
     assert result["items"][0]["review_approved"] is True
     assert result["items"][0]["review_issues"] == []
     assert result["items"][0]["quality_flags"] == []
+    assert result["items"][0]["result_verification"]["passed"] is True
+    assert result["items"][0]["process_verification"]["passed"] is True
+    assert result["items"][0]["quality_verification"]["passed"] is True
+    assert result["items"][0]["diagnosis"]["recommended_update_carrier"] == "none"
+    assert result["summary"]["trajectory_evaluations"] == 3
+    assert len(store.list_trajectory_logs()) == 3
+    assert len(store.list_trajectory_evaluations()) == 3
     report = Path(result["summary"]["evaluation_report_path"]).read_text(encoding="utf-8")
     assert "answer_excerpt" in report
     assert "search_record" in report
@@ -80,6 +87,10 @@ def test_evaluation_suite_flags_review_rejection_and_blocked_answer(tmp_path):
     assert "unsupported model-memory claims" in item["review_issues"]
     assert "review_rejected" in item["quality_flags"]
     assert "blocked_answer" in item["quality_flags"]
+    assert item["result_verification"]["flags"] == ["task_blocked"]
+    assert item["quality_verification"]["passed"] is False
+    assert item["diagnosis"]["recommended_update_carrier"] == "program_harness"
+    assert item["diagnosis"]["candidate_only"] is True
     assert result["summary"]["flagged_answers"] == 1
     assert result["summary"]["review_rejected_answers"] == 1
     experiences = store.list_experience_items()

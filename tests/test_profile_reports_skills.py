@@ -6,7 +6,7 @@ from search_assistant.profile.service import ProfileService
 from search_assistant.reports.service import ReportService
 from search_assistant.skills.service import SkillDraftService
 from search_assistant.contracts import IncomingMessage
-from search_assistant.workflow.runtime import FakeAgentRuntime
+from search_assistant.runtime import FakeAgentRuntime
 from search_assistant.workflow.service import SearchAssistantWorkflow
 
 

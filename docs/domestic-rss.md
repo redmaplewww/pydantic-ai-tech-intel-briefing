@@ -64,17 +64,17 @@ Template values are URL encoded. Missing values leave the source inactive. `feed
 | Douyin | `/douyin/user/{uid}` | Disabled | Needs a public user id and RSSHub browser support; anti-crawling can make it unavailable. |
 | Kuaishou | `/kuaishou/profile/{principal_id}` | Disabled | Needs a public profile id and RSSHub browser support. |
 
-## Baidu-only public-index discovery
+## Baidu-first public-index discovery
 
-WeChat public accounts, Toutiao, and Xiaohongshu are intentionally outside the RSSHub catalog and the domestic MCP binding. Their daily-brief coverage uses only Baidu's public mobile result page (`https://m.baidu.com/s`):
+WeChat public accounts, Toutiao, and Xiaohongshu are intentionally outside the RSSHub catalog and the domestic MCP binding. Their daily-brief coverage uses Baidu's public result pages first, preferring `https://www.baidu.com/baidu` and falling back to other public Baidu endpoints when one is challenged:
 
-| Platform | Baidu query | Detail-page fetch | Retained URL |
+| Platform | Public-index query | Detail-page fetch | Retained URL |
 | --- | --- | --- | --- |
 | WeChat public accounts | `site:mp.weixin.qq.com <topic>` | Disabled | The Baidu result's original `mp.weixin.qq.com` target. |
-| Toutiao | `site:toutiao.com <topic>` | Disabled | The Baidu result's original `toutiao.com` target. |
+| Toutiao | `site:toutiao.com <topic>` plus the public Toutiao search page | Disabled | The public search result's original `toutiao.com` target. |
 | Xiaohongshu | `site:xiaohongshu.com <topic>` and `site:xhslink.com <topic>` | Disabled | Each Baidu result's original `xiaohongshu.com` or `xhslink.com` target. |
 
-The assistant does not call platform APIs, RSSHub routes, platform search pages, or article/note detail pages for these three channels. Baidu click-tracking links are discarded unless Baidu exposes an original target URL in the public result markup. This remains public-index discovery, not exhaustive platform coverage.
+The assistant does not call login-gated platform APIs, RSSHub routes, or article/note detail pages for these three channels. Baidu remains the preferred public-index source for WeChat and Xiaohongshu; when a Baidu endpoint is blocked, another public Baidu endpoint is tried before the browser search client falls back to other configured public search engines and safer site-query variants. Toutiao also has a no-login public search-page parser because that page exposes original `toutiao.com` result URLs in its markup. Every fallback still enforces the original platform domain. Search-engine click-tracking links are discarded unless an original target URL is exposed in the public result markup. This remains public-index discovery, not exhaustive platform coverage.
 
 The upstream RSSHub project documents that these route capabilities can change independently. Treat a route as active only after its local health check and a real source response succeed. Do not represent a configured but failing route as coverage in a briefing.
 

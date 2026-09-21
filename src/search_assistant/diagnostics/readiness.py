@@ -11,6 +11,7 @@ from typing import Any
 
 from search_assistant.config import Settings
 from search_assistant.memory.store import MemoryStore
+from search_assistant.search.source_registry import source_contracts_as_dicts
 from search_assistant.skills.service import SkillDraftService
 
 
@@ -33,6 +34,8 @@ class ReadinessService:
         checks = [
             self._model_runtime_check(),
             self._browser_search_check(),
+            self._source_contract_check(),
+            self._provider_trace_check(),
             self._feishu_credentials_check(),
             self._runtime_session_check(),
             self._reply_attempt_check(),
@@ -156,6 +159,42 @@ class ReadinessService:
             "ok": True,
             "detail": "browser search engines include bing, baidu, and google",
             "data": {"configured_engines": self.settings.browser_search_engines},
+        }
+
+    def _source_contract_check(self) -> dict[str, Any]:
+        contracts = source_contracts_as_dicts()
+        unsafe_contracts = [
+            contract["slug"]
+            for contract in contracts
+            if contract.get("requires_login") or "write" not in contract.get("unsupported_actions", [])
+        ]
+        return {
+            "name": "source_contracts",
+            "ok": not unsafe_contracts,
+            "detail": "public-source contracts are registered and keep login/write actions unsupported"
+            if not unsafe_contracts
+            else "one or more source contracts violate the public-source boundary",
+            "data": {
+                "contract_count": len(contracts),
+                "unsafe_contracts": unsafe_contracts,
+            },
+        }
+
+    def _provider_trace_check(self) -> dict[str, Any]:
+        counts = self.store.diagnostic_counts()
+        events = counts.get("provider_trace_events", 0)
+        briefings = counts.get("daily_briefings", 0)
+        ok = events > 0 or briefings == 0
+        return {
+            "name": "provider_trace",
+            "ok": ok,
+            "detail": "provider trace events are present for briefing/search replay"
+            if events > 0
+            else "no provider trace is present yet; run brief-run once to generate it",
+            "data": {
+                "provider_trace_events": events,
+                "daily_briefings": briefings,
+            },
         }
 
     def _feishu_credentials_check(self) -> dict[str, Any]:

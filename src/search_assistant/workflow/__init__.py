@@ -1,1 +1,1 @@
-"""Answer workflow built around Microsoft Agent Framework adapters."""
+"""Runtime-agnostic answer workflow harness."""

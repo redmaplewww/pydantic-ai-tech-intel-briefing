@@ -12,7 +12,9 @@ in the other documents under `docs/`.
 | `config` | Environment-backed settings. Secrets are read at runtime and never written to reports. |
 | `search` | Browser, MCP, RSSHub, public Bilibili, Brave, SearXNG, and fallback search adapters. |
 | `mcp` | Read-only local MCP servers for public sources and domestic RSS feeds. |
+| `runtime` | Runtime protocols, deterministic fake runtime, and Pydantic AI provider adapters for GLM and DeepSeek. |
 | `briefing` | Topic planning, source filtering, ranking, synthesis, Markdown rendering, and feedback handling. |
+| `knowledge_graph` | Reviewed domain graph seeds and query/export helpers for GraphRAG-style entity-relation knowledge. |
 | `workflow` | Ordinary question-answering, verification, calibration, final review, and active-skill context. |
 | `memory` | SQLite schema and scoped persistence. |
 | `verification` | Claim extraction, deterministic source matching, and evidence backfill. |
@@ -22,16 +24,16 @@ in the other documents under `docs/`.
 
 ## Briefing Flow
 
-1. `DailyBriefingService.build_search_plan()` combines user feedback, GLM
-   planning output, deterministic technical coverage queries, and platform
-   routes.
+1. `DailyBriefingService.build_search_plan()` combines user feedback, the
+   configured Pydantic AI model provider's planning output, deterministic
+   technical coverage queries, and platform routes.
 2. `_collect_sources()` runs retrieval concurrently under a budget, rejects
    search-page dumps, generic references, login pages, invalid platform URLs,
    and obvious false positives, then stores compact source evidence.
 3. Sources are deduplicated and ranked. The full retained set remains in SQLite
    and the report; only the highest-ranked evidence is sent to the synthesis
    model.
-4. `GLMPydanticAIRuntime.synthesize_briefing()` returns validated JSON with a
+4. `PydanticAIModelRuntime.synthesize_briefing()` returns validated JSON with a
    concise technical summary, free-form detailed analysis, evidence anchors,
    next research directions, and implementation suggestions. A timeout retries
    with a smaller evidence set.
@@ -51,10 +53,13 @@ in the other documents under `docs/`.
 ## Extension Points
 
 - Add a public source through `search/provider.py` or a read-only MCP binding.
+- Add a reviewed domain graph through `knowledge_graph/seeds.py`, then cover it
+  with query/export tests before using it in retrieval or briefing logic.
 - Add platform constraints in `configs/domestic-rss.sources.json` and verify
   original-domain enforcement with tests.
-- Add a model runtime by implementing `AgentRuntime` and wiring it in
-  `runtime_from_settings()`.
+- Add a model provider by extending `runtime/pydantic_ai.py` and wiring it in
+  `runtime_from_settings()`. Keep business code behind `AgentRuntime` or
+  `BriefingRuntime` protocols instead of importing a provider SDK directly.
 - Add quality cases in the existing test modules before changing filtering,
   report shape, or verification policy.
 

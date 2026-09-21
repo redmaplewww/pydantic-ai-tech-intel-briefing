@@ -1,5 +1,10 @@
 # Search Assistant Design
 
+> Historical / Superseded: this June 2026 design records the initial MVP
+> request and is preserved for traceability. It is superseded by
+> `docs/adr/0001-pydantic-ai-primary-runtime.md`, which defines Pydantic AI as
+> the primary runtime and treats GLM/DeepSeek as model providers.
+
 Date: 2026-06-26
 Status: Approved for design by user; awaiting written-spec review before implementation planning
 Workspace: `F:\opencode\search-assistant` logical project; actual local folder is the current workspace.

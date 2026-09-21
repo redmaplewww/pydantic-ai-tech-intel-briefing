@@ -3,7 +3,7 @@ from fastapi.testclient import TestClient
 from search_assistant.feishu.client import FakeFeishuClient
 from search_assistant.memory.store import MemoryStore
 from search_assistant.server import create_app
-from search_assistant.workflow.runtime import FakeAgentRuntime
+from search_assistant.runtime import FakeAgentRuntime
 
 
 def test_feishu_webhook_replies_with_answer(tmp_path):

@@ -2,7 +2,7 @@ from fastapi.testclient import TestClient
 
 from search_assistant.feishu.client import FakeFeishuClient
 from search_assistant.server import create_app
-from search_assistant.workflow.runtime import FakeAgentRuntime
+from search_assistant.runtime import FakeAgentRuntime
 
 
 def test_phase_1_acceptance_flow(tmp_path):

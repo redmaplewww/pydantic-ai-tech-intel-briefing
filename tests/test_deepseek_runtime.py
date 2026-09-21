@@ -3,10 +3,11 @@ import json
 import pytest
 
 from search_assistant.config import Settings
-from search_assistant.workflow.runtime import DeepSeekChatRuntime, runtime_from_settings
+from search_assistant.runtime import DeepSeekChatRuntime
+from search_assistant.runtime.pydantic_ai import runtime_from_settings
 
 
-def test_deepseek_runtime_uses_microsoft_agent_framework_runner():
+def test_deepseek_runtime_uses_pydantic_ai_runner_contract():
     calls = []
 
     def agent_runner(model, api_key, base_url, instructions, prompt, temperature, max_tokens, timeout_seconds):
@@ -224,6 +225,66 @@ def test_deepseek_runtime_final_review_agent_checks_answer_against_sources_and_f
     assert calls[0]["prompt"]["experience"][0]["title"] == "User feedback: search and answer correction"
     assert calls[0]["temperature"] == 0.0
     assert calls[0]["max_tokens"] <= 1200
+
+
+def test_deepseek_runtime_review_retries_once_on_parse_failure():
+    calls = []
+
+    def agent_runner(model, api_key, base_url, instructions, prompt, temperature, max_tokens, timeout_seconds):
+        calls.append(temperature)
+        if len(calls) == 1:
+            return "not json at all"
+        return json.dumps(
+            {
+                "approved": True,
+                "issues": [],
+                "revision": "reviewed answer",
+            }
+        )
+
+    runtime = DeepSeekChatRuntime(api_key="test-key", agent_runner=agent_runner)
+
+    result = runtime.review_answer(
+        "draft answer",
+        {
+            "question": "What is CXL?",
+            "classification": "research",
+            "search_queries": ["CXL memory pooling"],
+            "search_results": [{"title": "CXL", "url": "https://example.com/cxl", "snippet": "memory pooling"}],
+        },
+    )
+
+    assert len(calls) == 2, "the review must be retried once after a parse failure"
+    assert result["approved"] is True
+    assert result["parse_failed"] is False
+    assert result["retried_after_parse_failure"] is True
+    assert result["revision"] == "reviewed answer"
+
+
+def test_deepseek_runtime_review_falls_back_when_retry_also_fails():
+    calls = []
+
+    def agent_runner(model, api_key, base_url, instructions, prompt, temperature, max_tokens, timeout_seconds):
+        calls.append(temperature)
+        return "still not json"
+
+    runtime = DeepSeekChatRuntime(api_key="test-key", agent_runner=agent_runner)
+
+    result = runtime.review_answer(
+        "draft answer",
+        {
+            "question": "What is CXL?",
+            "classification": "research",
+            "search_queries": ["CXL memory pooling"],
+            "search_results": [{"title": "CXL", "url": "https://example.com/cxl", "snippet": "memory pooling"}],
+        },
+    )
+
+    assert len(calls) == 2
+    assert result["approved"] is False
+    assert result["parse_failed"] is True
+    assert "did not return JSON" in result["issues"][0]
+    assert result["revision"] == "draft answer"
 
 
 def test_deepseek_runtime_plans_search_queries_from_intent_and_experience():

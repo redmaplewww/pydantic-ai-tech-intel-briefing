@@ -2,7 +2,7 @@ import json
 
 from search_assistant.feishu.polling import FeishuPollingService
 from search_assistant.memory.store import MemoryStore
-from search_assistant.workflow.runtime import FakeAgentRuntime
+from search_assistant.runtime import FakeAgentRuntime
 
 
 def test_polling_service_answers_new_user_messages_and_skips_existing_or_app_messages(tmp_path):

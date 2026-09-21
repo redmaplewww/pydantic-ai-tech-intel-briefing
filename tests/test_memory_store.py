@@ -1,4 +1,15 @@
-from search_assistant.contracts import AnswerPackage, IncomingMessage, VerifiedClaim
+import sqlite3
+
+import pytest
+
+from search_assistant.contracts import (
+    AnswerPackage,
+    IncomingMessage,
+    ProviderTraceEvent,
+    SearchRecord,
+    SourceCandidate,
+    VerifiedClaim,
+)
 from search_assistant.memory.store import MemoryStore
 
 
@@ -29,6 +40,53 @@ def test_records_interaction_answer_and_evidence(tmp_path):
 
     assert store.has_interaction("e-1")
     assert store.latest_answer_for_dedupe_key("e-1").question_id == question_id
+
+
+def test_answer_recording_appends_an_immutable_trajectory(tmp_path):
+    database_path = tmp_path / "assistant.sqlite3"
+    store = MemoryStore(database_path)
+    store.initialize()
+    question_id = store.record_interaction(
+        IncomingMessage(
+            message_id="m-trajectory",
+            event_id="e-trajectory",
+            user_id="u-trajectory",
+            chat_id="c-trajectory",
+            text="What changed in the current API?",
+            source="cli",
+        )
+    )
+    package = AnswerPackage(
+        question_id=question_id,
+        answer_text="The answer is traceable to the recorded search.",
+        classification="research",
+        confidence="medium",
+        search_record=SearchRecord(executed=True, queries=["current API official docs"]),
+        trajectory_context={
+            "draft_answer": "Initial draft",
+            "active_skills": [{"name": "verification"}],
+            "runtime_metadata": {"runtime_class": "FakeAgentRuntime"},
+        },
+    )
+
+    store.record_answer(package)
+
+    trajectories = store.list_trajectory_logs("u-trajectory", "c-trajectory")
+    assert len(trajectories) == 1
+    assert trajectories[0]["question_id"] == question_id
+    assert trajectories[0]["payload"]["question"] == "What changed in the current API?"
+    assert trajectories[0]["payload"]["draft_answer"] == "Initial draft"
+    assert trajectories[0]["payload"]["search_record"]["executed"] is True
+    assert trajectories[0]["payload"]["active_skills"] == [{"name": "verification"}]
+
+    with sqlite3.connect(database_path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="trajectory logs are immutable"):
+            connection.execute(
+                "UPDATE trajectory_logs SET source = 'changed' WHERE question_id = ?",
+                (question_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="trajectory logs are immutable"):
+            connection.execute("DELETE FROM trajectory_logs WHERE question_id = ?", (question_id,))
 
 
 def test_updates_answer_verification_and_deduplicates_evidence(tmp_path):
@@ -211,3 +269,67 @@ def test_records_experience_items(tmp_path):
     assert rows[0]["title"] == "Verify API claims before replying"
     assert "search first" in rows[0]["body"]
     assert rows[0]["source_ids_json"] == '["q-1", "ev-1"]'
+
+
+def test_records_source_candidates_provider_trace_feedback_signals_and_layered_memory(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    topic = store.upsert_topic("u-1", "c-1", "industrial AI")
+    store.set_topic_source_recipe(topic.id, {"general-web": 3.0, "bilibili": 1.0})
+    refreshed = store.upsert_topic("u-1", "c-1", "industrial AI")
+
+    candidate = SourceCandidate(
+        id="cand-1",
+        topic_id=topic.id,
+        user_id="u-1",
+        title="Industrial AI",
+        url="https://example.com/industrial-ai",
+        snippet="Agent connects MES work orders.",
+        platform="web",
+        provider="browser-bing",
+        query="industrial AI",
+        status="accepted",
+        reason="accepted for briefing ranking",
+        relevance_score=2.0,
+        importance_score=8.0,
+        retrieved_at="2026-07-25T00:00:00Z",
+        created_at="2026-07-25T00:00:00Z",
+    )
+    event = ProviderTraceEvent(
+        provider="browser-bing",
+        query="industrial AI",
+        status="success",
+        result_count=1,
+        tier="tier-3",
+        budget_share=0.2,
+        checked_at="2026-07-25T00:00:00Z",
+    )
+
+    store.record_source_candidate(candidate)
+    store.record_provider_trace_event(event, run_id="brief-1", topic_id=topic.id)
+    signal_id = store.add_topic_feedback_signal(
+        topic.id,
+        "u-1",
+        "c-1",
+        signal_type="style",
+        scope="topic",
+        body="Make the briefing easier to read.",
+        metadata={"feedback_id": "feedback-1"},
+    )
+    memory_id = store.add_layered_memory_item(
+        "preference",
+        "briefing_style_feedback",
+        "Make the briefing easier to read.",
+        source_id=signal_id,
+        user_id="u-1",
+        chat_id="c-1",
+    )
+
+    assert refreshed.source_recipe == {"general-web": 3.0, "bilibili": 1.0}
+    assert store.list_source_candidates(topic_id=topic.id)[0].status == "accepted"
+    stored_event = store.list_provider_trace_events(topic_id=topic.id)[0]
+    assert stored_event.provider == "browser-bing"
+    assert stored_event.tier == "tier-3"
+    assert stored_event.budget_share == 0.2
+    assert store.list_topic_feedback_signals(topic.id)[0].metadata["feedback_id"] == "feedback-1"
+    assert store.list_layered_memory_items("preference", "u-1", "c-1")[0].id == memory_id

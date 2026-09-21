@@ -8,8 +8,50 @@ from search_assistant.contracts import AnswerPackage, IncomingMessage
 from search_assistant.memory.store import MemoryStore
 from search_assistant.search.provider import SearchResult
 from search_assistant.skills.service import SkillDraftService
-from search_assistant.workflow.runtime import FakeAgentRuntime
+from search_assistant.runtime import FakeAgentRuntime
+from search_assistant.workflow.grounding import (
+    build_question_profile,
+    classify_question_profile,
+    decide_grounding_policy,
+)
 from search_assistant.workflow.service import SearchAssistantWorkflow
+
+
+@pytest.mark.parametrize(
+    ("question", "expected_category", "expected_classification", "expected_claim_type"),
+    [
+        ("能否解释向量数据库", "foundational", "research", "concept"),
+        ("Can you explain cache coherence?", "foundational", "research", "concept"),
+        ("Redis 最新版本是什么", "evidence_required", "research", "current_fact"),
+        ("某型号具体带宽是多少", "evidence_required", "hard", "precise_number"),
+        ("4 张某加速卡能否部署某模型", "evidence_required", "hard", "deployment_feasibility"),
+    ],
+)
+def test_question_profile_drives_classification_and_grounding_policy(
+    question,
+    expected_category,
+    expected_classification,
+    expected_claim_type,
+):
+    profile = build_question_profile(question)
+    classification = classify_question_profile(profile)
+    decision = decide_grounding_policy(profile, classification)
+
+    assert classification == expected_classification
+    assert decision.category == expected_category
+    assert expected_claim_type in profile.requested_claim_types
+    assert decision.allow_stable_model_knowledge is (expected_category == "foundational")
+    assert decision.require_retrieval_sources is (expected_category != "foundational")
+    assert decision.precise_numbers_require_sources is True
+    assert decision.vendor_version_claims_require_sources is True
+
+
+def test_broad_can_or_nengfou_does_not_make_explanation_a_deployment_question():
+    chinese_profile = build_question_profile("能否解释向量数据库")
+    english_profile = build_question_profile("Can you explain cache coherence?")
+
+    assert "deployment_feasibility" not in chinese_profile.requested_claim_types
+    assert "deployment_feasibility" not in english_profile.requested_claim_types
 
 
 def test_hard_question_runs_calibration_and_persists_answer(tmp_path):
@@ -520,7 +562,7 @@ def test_foundational_distributed_model_question_still_answers_when_review_rejec
     assert "搜索记录:" in package.answer_text
 
 
-def test_foundational_distributed_model_question_repairs_refusal_revision_under_fallback(tmp_path):
+def test_foundational_distributed_model_question_uses_policy_fallback_for_refusal_revision(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
     runtime = ReviewingRuntime(review_revision="搜索结果相关性不足：当前来源不足，不能回答。")
@@ -545,7 +587,7 @@ def test_foundational_distributed_model_question_repairs_refusal_revision_under_
     assert "互联" in package.answer_text
 
 
-def test_foundational_distributed_model_question_repairs_source_refusal_even_with_relevant_sources(tmp_path):
+def test_foundational_distributed_model_question_uses_policy_fallback_even_with_relevant_sources(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
     runtime = ReviewingRuntime(review_revision="搜索内容不足：当前来源不足，不能回答。")
@@ -583,11 +625,11 @@ def test_foundational_distributed_model_question_repairs_source_refusal_even_wit
     assert package.confidence == "low"
     assert "当前来源不足，不能回答" not in package.answer_text
     assert "可以这么理解" in package.answer_text
-    assert "多个计算节点协同" in package.answer_text
+    assert "稳定概念" in package.answer_text
     assert "搜索记录:" in package.answer_text
 
 
-def test_foundational_question_repairs_retrieval_insufficiency_refusal_wording(tmp_path):
+def test_foundational_question_uses_policy_fallback_for_retrieval_insufficiency_refusal(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
     runtime = ReviewingRuntime(review_revision="根据当前检索结果，无法确认这个理解是否成立，建议补充更相关来源后再判断。")
@@ -613,7 +655,7 @@ def test_foundational_question_repairs_retrieval_insufficiency_refusal_wording(t
     assert "搜索记录:" in package.answer_text
 
 
-def test_foundational_question_repairs_source_stall_without_explicit_refusal_wording(tmp_path):
+def test_foundational_question_uses_policy_fallback_for_source_stall_without_explicit_refusal(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
     runtime = ReviewingRuntime(review_revision="搜索内容不足：建议补充更相关来源后再判断。")
@@ -639,7 +681,7 @@ def test_foundational_question_repairs_source_stall_without_explicit_refusal_wor
     assert "搜索记录:" in package.answer_text
 
 
-def test_foundational_question_repairs_source_stall_even_when_revision_mentions_concepts(tmp_path):
+def test_foundational_question_uses_policy_fallback_even_when_revision_mentions_concepts(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
     runtime = ReviewingRuntime(
@@ -665,12 +707,12 @@ def test_foundational_question_repairs_source_stall_even_when_revision_mentions_
     assert "不建议直接判断" not in package.answer_text
     assert "建议补充更相关来源后再回答" not in package.answer_text
     assert "可以这么理解" in package.answer_text
-    assert "多个计算节点协同" in package.answer_text
+    assert "稳定概念" in package.answer_text
     assert "低置信说明" in package.answer_text
     assert "搜索记录:" in package.answer_text
 
 
-def test_foundational_question_repairs_soft_evidence_deferral_wording(tmp_path):
+def test_foundational_question_uses_policy_fallback_for_soft_evidence_deferral_wording(tmp_path):
     store = MemoryStore(tmp_path / "assistant.sqlite3")
     store.initialize()
     runtime = ReviewingRuntime(review_revision="现有证据不够充分，暂时不能判断。")
@@ -692,8 +734,181 @@ def test_foundational_question_repairs_soft_evidence_deferral_wording(tmp_path):
 
     assert "现有证据不够充分，暂时不能判断" not in package.answer_text
     assert "可以这么理解" in package.answer_text
-    assert "多个计算节点协同" in package.answer_text
+    assert "稳定概念" in package.answer_text
     assert "低置信说明" in package.answer_text
+
+
+def test_foundational_concept_question_can_answer_when_search_has_no_sources(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    runtime = ReviewingRuntime(review_revision="搜索内容不足：当前来源不足，不能回答。")
+    search = RecordingSearchClient([])
+    workflow = SearchAssistantWorkflow(store=store, runtime=runtime, search_client=search)
+    message = IncomingMessage(
+        message_id="m-grounding-foundational-empty-search",
+        event_id="e-grounding-foundational-empty-search",
+        user_id="u-1",
+        chat_id="c-1",
+        text="什么是缓存一致性互连？",
+        source="cli",
+    )
+
+    package = workflow.answer(message)
+
+    assert runtime.answer_contexts
+    policy = runtime.answer_contexts[0]["grounding_policy"]
+    assert policy["category"] == "foundational"
+    assert policy["allow_stable_model_knowledge"] is True
+    assert policy["require_retrieval_sources"] is False
+    assert policy["allow_precise_numbers"] is False
+    assert policy["allow_vendor_version_claims"] is False
+    assert package.confidence == "low"
+    assert "当前来源不足，不能回答" not in package.answer_text
+    assert "基础解释" in package.answer_text
+    assert "低置信说明" in package.answer_text
+
+
+def test_current_fact_question_refuses_definite_answer_without_sources(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    runtime = FakeAgentRuntime(answer_text="FastAPI 9.9.9 is the latest release today.")
+    search = RecordingSearchClient([])
+    workflow = SearchAssistantWorkflow(store=store, runtime=runtime, search_client=search)
+    message = IncomingMessage(
+        message_id="m-grounding-current-empty-search",
+        event_id="e-grounding-current-empty-search",
+        user_id="u-1",
+        chat_id="c-1",
+        text="What is the latest FastAPI version today?",
+        source="cli",
+    )
+
+    package = workflow.answer(message)
+
+    assert runtime.answer_calls == 0
+    policy = package.trajectory_context["grounding_policy"]
+    assert policy["category"] == "evidence_required"
+    assert policy["allow_stable_model_knowledge"] is False
+    assert policy["require_retrieval_sources"] is True
+    assert policy["allow_precise_numbers"] is True
+    assert policy["allow_vendor_version_claims"] is True
+    assert "9.9.9" not in package.answer_text
+    assert "搜索未返回可用结果" in package.answer_text
+    assert package.review["approved"] is False
+    assert package.confidence == "low"
+
+
+def test_exact_spec_question_removes_numbers_when_no_source_supports_them(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    runtime = FakeAgentRuntime(answer_text="The accelerator has 512 GB memory and 900 GB/s bandwidth.")
+    search = RecordingSearchClient([])
+    workflow = SearchAssistantWorkflow(store=store, runtime=runtime, search_client=search)
+    message = IncomingMessage(
+        message_id="m-grounding-exact-spec-empty-search",
+        event_id="e-grounding-exact-spec-empty-search",
+        user_id="u-1",
+        chat_id="c-1",
+        text="What are the exact memory capacity and bandwidth specs of ACME X9000?",
+        source="cli",
+    )
+
+    package = workflow.answer(message)
+
+    assert runtime.answer_calls == 0
+    assert "512 GB" not in package.answer_text
+    assert "900 GB/s" not in package.answer_text
+    assert "搜索未返回可用结果" in package.answer_text
+    assert package.confidence == "low"
+
+
+def test_deployment_reasoning_separates_known_sources_from_missing_assumptions(tmp_path):
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    runtime = FakeAgentRuntime(
+        answer_text=(
+            "Eight ACME X900 systems can deploy Model-Z9. "
+            "The combined memory is enough and expected throughput is 15 tok/s."
+        )
+    )
+    search = RecordingSearchClient(
+        [
+            SearchResult(
+                title="ACME X900 official system specifications",
+                url="https://example.com/acme-x900-specs",
+                snippet="ACME X900 official specifications list 256 GB unified memory per system.",
+                provider="direct-official",
+                checked_at="2026-08-22T00:00:00Z",
+            )
+        ]
+    )
+    workflow = SearchAssistantWorkflow(store=store, runtime=runtime, search_client=search)
+    message = IncomingMessage(
+        message_id="m-grounding-deployment-missing-model-evidence",
+        event_id="e-grounding-deployment-missing-model-evidence",
+        user_id="u-1",
+        chat_id="c-1",
+        text="Can 8 ACME X900 systems deploy Model-Z9? Include calculation assumptions and limits.",
+        source="cli",
+    )
+
+    package = workflow.answer(message)
+
+    assert "can deploy Model-Z9" not in package.answer_text
+    assert "15 tok/s" not in package.answer_text
+    assert "cannot confirm" in package.answer_text
+    assert "ACME X900 official system specifications" in package.answer_text
+    assert "model parameters" in package.answer_text
+    assert "benchmark" in package.answer_text
+
+
+def test_empty_search_treats_foundational_and_evidence_required_questions_differently(tmp_path):
+    foundational_store = MemoryStore(tmp_path / "foundational.sqlite3")
+    foundational_store.initialize()
+    foundational_runtime = ReviewingRuntime(review_revision="检索证据不足，不能回答。")
+    foundational_workflow = SearchAssistantWorkflow(
+        store=foundational_store,
+        runtime=foundational_runtime,
+        search_client=RecordingSearchClient([]),
+    )
+
+    foundational = foundational_workflow.answer(
+        IncomingMessage(
+            message_id="m-grounding-empty-foundational",
+            event_id="e-grounding-empty-foundational",
+            user_id="u-1",
+            chat_id="c-1",
+            text="解释一下向量数据库的基本概念。",
+            source="cli",
+        )
+    )
+
+    evidence_store = MemoryStore(tmp_path / "evidence.sqlite3")
+    evidence_store.initialize()
+    evidence_runtime = FakeAgentRuntime(answer_text="ACME X900 was released on August 1, 2026.")
+    evidence_workflow = SearchAssistantWorkflow(
+        store=evidence_store,
+        runtime=evidence_runtime,
+        search_client=RecordingSearchClient([]),
+    )
+
+    evidence_required = evidence_workflow.answer(
+        IncomingMessage(
+            message_id="m-grounding-empty-evidence-required",
+            event_id="e-grounding-empty-evidence-required",
+            user_id="u-1",
+            chat_id="c-1",
+            text="What is the current release date of ACME X900 in 2026?",
+            source="cli",
+        )
+    )
+
+    assert foundational_runtime.answer_contexts
+    assert "基础解释" in foundational.answer_text
+    assert "不能回答" not in foundational.answer_text
+    assert evidence_runtime.answer_calls == 0
+    assert "August 1, 2026" not in evidence_required.answer_text
+    assert "搜索未返回可用结果" in evidence_required.answer_text
 
 
 def test_relevance_gate_allows_strong_acronym_source_match(tmp_path):
@@ -981,9 +1196,9 @@ def test_hardware_deployment_gap_replaces_unsupported_positive_feasibility_answe
     assert "can probably fit" not in package.answer_text
     assert "few tok/s" not in package.answer_text
     assert "cannot confirm" in package.answer_text
-    assert "DeepSeek-V4 public model parameters" in package.answer_text
+    assert "requested model parameters" in package.answer_text
     assert "NVIDIA DGX Spark official specifications" in package.answer_text
-    assert any("Unsupported hardware deployment feasibility answer" in claim for claim in package.unverified_claims)
+    assert any("Unsupported evidence-required answer replaced" in claim for claim in package.unverified_claims)
 
 
 def test_hardware_deployment_gap_replaces_uncertain_answer_with_conditional_fit_claim(tmp_path):
@@ -1032,8 +1247,8 @@ def test_hardware_deployment_gap_replaces_uncertain_answer_with_conditional_fit_
     assert "确实小于 128 GB" not in package.answer_text
     assert "可能装下" not in package.answer_text
     assert "cannot confirm" in package.answer_text
-    assert "DeepSeek-V4 public model parameters" in package.answer_text
-    assert any("Unsupported hardware deployment feasibility answer" in claim for claim in package.unverified_claims)
+    assert "requested model parameters" in package.answer_text
+    assert any("Unsupported evidence-required answer replaced" in claim for claim in package.unverified_claims)
 
 
 def test_hardware_deployment_ignores_parameter_numbers_echoed_from_search_query(tmp_path):
@@ -1084,8 +1299,8 @@ def test_hardware_deployment_ignores_parameter_numbers_echoed_from_search_query(
     assert "can probably fit" not in package.answer_text
     assert "single-digit tok/s" not in package.answer_text
     assert "cannot confirm" in package.answer_text
-    assert "DeepSeek-V4 public model parameters" in package.answer_text
-    assert any("Unsupported hardware deployment feasibility answer" in claim for claim in package.unverified_claims)
+    assert "requested model parameters" in package.answer_text
+    assert any("Unsupported evidence-required answer replaced" in claim for claim in package.unverified_claims)
 
 
 def test_hardware_deployment_does_not_use_v3_parameters_as_v4_evidence(tmp_path):
@@ -1144,8 +1359,8 @@ def test_hardware_deployment_does_not_use_v3_parameters_as_v4_evidence(tmp_path)
     assert "有可能在内存层面装下" not in package.answer_text
     assert "权重肯定放得下" not in package.answer_text
     assert "cannot confirm" in package.answer_text
-    assert "DeepSeek-V4 public model parameters" in package.answer_text
-    assert any("Unsupported hardware deployment feasibility answer" in claim for claim in package.unverified_claims)
+    assert "requested model parameters" in package.answer_text
+    assert any("Unsupported evidence-required answer replaced" in claim for claim in package.unverified_claims)
 
 
 def test_workflow_uses_runtime_search_plan_instead_of_topic_hardcoding(tmp_path):

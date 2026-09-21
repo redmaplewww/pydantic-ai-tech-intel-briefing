@@ -137,6 +137,38 @@ def test_cli_doctor_outputs_readiness_json(monkeypatch, tmp_path):
     assert output["checks"][0]["name"] == "model_runtime"
 
 
+def test_cli_source_contracts_and_topic_recipe_commands(monkeypatch, tmp_path):
+    from search_assistant import cli
+
+    stream = TextIOWrapper(BytesIO(), encoding="ascii")
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    assert cli.main(["source-contracts", "--data-dir", str(tmp_path)]) == 0
+    stream.flush()
+    contracts = json.loads(stream.buffer.getvalue().decode("utf-8"))
+    assert any(contract["slug"] == "bilibili" for contract in contracts)
+
+    stream = TextIOWrapper(BytesIO(), encoding="ascii")
+    monkeypatch.setattr(sys, "stdout", stream)
+    assert (
+        cli.main(
+            [
+                "topic-recipe-set",
+                "industrial AI",
+                '{"web": 3, "bili": 1}',
+                "--data-dir",
+                str(tmp_path),
+            ]
+        )
+        == 0
+    )
+    stream.flush()
+    output = json.loads(stream.buffer.getvalue().decode("utf-8"))
+    weights = {item["slug"]: item["weight"] for item in output["source_recipe"]["sources"]}
+    assert weights["general-web"] == 3.0
+    assert weights["bilibili"] == 1.0
+
+
 def test_cli_feishu_fixture_updates_profile_snapshot(monkeypatch, tmp_path):
     from search_assistant import cli
 
@@ -505,9 +537,9 @@ def test_cli_eval_suite_uses_default_questions(monkeypatch, tmp_path):
     stream.flush()
     output = json.loads(stream.buffer.getvalue().decode("utf-8"))
 
-    assert output["total_questions"] == 4
-    assert "GB10" in output["items"][0]["question"]
-    assert any("分布式大模型" in item["question"] for item in output["items"])
+    assert output["total_questions"] == 12  # layered pool is the default
+    assert any("KV Cache" in item["question"] for item in output["items"])
+    assert any("MCP" in item["question"] or "RAG" in item["question"] for item in output["items"])
 
 
 def test_cli_eval_suite_limits_default_questions_with_max_questions(monkeypatch, tmp_path):
@@ -527,8 +559,52 @@ def test_cli_eval_suite_limits_default_questions_with_max_questions(monkeypatch,
     store.initialize()
     assert output["total_questions"] == 1
     assert len(output["items"]) == 1
-    assert "GB10" in output["items"][0]["question"]
+    assert "KV Cache" in output["items"][0]["question"]
     assert len(store.list_answers()) == 1
+
+
+def test_cli_eval_replay_reruns_previous_evaluation_questions(monkeypatch, tmp_path):
+    from search_assistant import cli
+
+    monkeypatch.setenv("SEARCH_ASSISTANT_MODEL_PROVIDER", "fake")
+    monkeypatch.setenv("SEARCH_ASSISTANT_ALLOW_FAKE_RUNTIME", "true")
+    monkeypatch.setattr(cli, "search_client_from_settings", lambda settings: EmptySearchClient())
+    eval_dir = tmp_path / "evaluations"
+    eval_dir.mkdir()
+    report = {
+        "total_questions": 1,
+        "items": [
+            {
+                "index": 1,
+                "question": "What is CXL?",
+                "question_id": "q-old",
+                "answer_excerpt": "old answer",
+                "source_urls": [],
+                "quality_flags": [],
+            }
+        ],
+        "summary": {
+            "flagged_answers": 0,
+            "review_rejected_answers": 0,
+            "result_failed_answers": 0,
+            "process_flagged_answers": 0,
+        },
+    }
+    (eval_dir / "evaluation-report.json").write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+    stream = TextIOWrapper(BytesIO(), encoding="ascii")
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    assert cli.main(["eval-replay", "--data-dir", str(tmp_path)]) == 0
+    stream.flush()
+    output = json.loads(stream.buffer.getvalue().decode("utf-8"))
+
+    store = MemoryStore(tmp_path / "assistant.sqlite3")
+    store.initialize()
+    assert output["ok"] is True
+    assert output["replayed"] == 1
+    assert Path(output["replay_report_path"]).exists()
+    assert store.list_gate_records(gate_type="evaluation_replay")[0]["result"] == "passed"
+    assert store.list_project_ledger_entries(entry_type="evaluation_replay")[0]["status"] == "completed"
 
 
 def test_cli_skill_draft_uses_existing_profile_sources(monkeypatch, tmp_path):

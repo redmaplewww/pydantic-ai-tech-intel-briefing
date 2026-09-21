@@ -10,7 +10,7 @@ from search_assistant.feishu.formatting import reply_answer_package
 from search_assistant.memory.store import MemoryStore
 from search_assistant.profile.service import ProfileService
 from search_assistant.search.provider import SearchClient
-from search_assistant.workflow.runtime import AgentRuntime
+from search_assistant.runtime import AgentRuntime
 from search_assistant.workflow.service import SearchAssistantWorkflow
 
 

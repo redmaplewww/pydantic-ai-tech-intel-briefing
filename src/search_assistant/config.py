@@ -91,15 +91,19 @@ class Settings(BaseModel):
     searxng_timeout_seconds: float = 12.0
     mcp_search_config_path: Path | None = None
     mcp_search_timeout_seconds: float = 18.0
+    agent_reach_enabled: bool = False
+    agent_reach_command: str = "agent-reach"
+    agent_reach_timeout_seconds: float = 30.0
+    agent_reach_doctor_cache_seconds: float = 300.0
     domestic_rss_base_url: str = "http://127.0.0.1:1200"
     domestic_rss_config_path: Path | None = None
     domestic_rss_timeout_seconds: float = 8.0
     bilibili_search_base_url: str = "https://api.bilibili.com/x/web-interface/search/type"
     duckduckgo_timeout_seconds: float = 12.0
-    browser_search_base_url: str = "https://www.bing.com/search"
+    browser_search_base_url: str = "https://cn.bing.com/search"
     browser_search_market: str = "zh-CN"
     browser_search_engines: list[str] = Field(default_factory=lambda: ["bing", "baidu", "google"])
-    baidu_search_base_url: str = "https://m.baidu.com/s"
+    baidu_search_base_url: str = "https://www.baidu.com/baidu"
     google_search_base_url: str = "https://www.google.com/search"
     browser_search_timeout_seconds: float = 8.0
     browser_content_timeout_seconds: float = 3.0
@@ -107,6 +111,11 @@ class Settings(BaseModel):
     workflow_search_budget_seconds: float = 45.0
     briefing_search_budget_seconds: float = 90.0
     briefing_planning_timeout_seconds: float = 40.0
+    # Briefing synthesis needs more headroom than general calls: 25+ sources
+    # regularly take 60-70s (measured), so the default is 120s instead of the
+    # 60s general deepseek timeout.  A synthesis that times out silently
+    # degrades the whole report to the deterministic fallback templates.
+    briefing_synthesis_timeout_seconds: float = 120.0
     deepseek_timeout_seconds: float = 60.0
     briefing_max_queries: int = 28
     briefing_results_per_query: int = 10
@@ -114,6 +123,15 @@ class Settings(BaseModel):
     briefing_model_max_sources: int = 12
     briefing_timezone: str = "Asia/Shanghai"
     admin_user_ids: list[str] = Field(default_factory=list)
+
+    # Knowledge-graph semantic matching
+    # These fields use an OpenAI-compatible embedding API.  If OPENAI_API_KEY is
+    # not set, the provider falls back to DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL so
+    # DeepSeek-compatible endpoints or third-party proxies can be reused.
+    embedding_enabled: bool = True
+    openai_api_key: str | None = None
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_embedding_model: str = "text-embedding-3-small"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -160,6 +178,10 @@ class Settings(BaseModel):
                 else None
             ),
             "mcp_search_timeout_seconds": _to_float(source.get("MCP_SEARCH_TIMEOUT_SECONDS"), 18.0),
+            "agent_reach_enabled": _to_bool(source.get("SEARCH_ASSISTANT_AGENT_REACH_ENABLED"), default=False),
+            "agent_reach_command": source.get("AGENT_REACH_COMMAND", "agent-reach"),
+            "agent_reach_timeout_seconds": _to_float(source.get("AGENT_REACH_TIMEOUT_SECONDS"), 30.0),
+            "agent_reach_doctor_cache_seconds": _to_float(source.get("AGENT_REACH_DOCTOR_CACHE_SECONDS"), 300.0),
             "domestic_rss_base_url": source.get("RSSHUB_BASE_URL", "http://127.0.0.1:1200"),
             "domestic_rss_config_path": (
                 Path(source["SEARCH_ASSISTANT_DOMESTIC_RSS_CONFIG"])
@@ -172,13 +194,13 @@ class Settings(BaseModel):
                 "https://api.bilibili.com/x/web-interface/search/type",
             ),
             "duckduckgo_timeout_seconds": _to_float(source.get("DUCKDUCKGO_TIMEOUT_SECONDS"), 12.0),
-            "browser_search_base_url": source.get("BROWSER_SEARCH_BASE_URL", "https://www.bing.com/search"),
+            "browser_search_base_url": source.get("BROWSER_SEARCH_BASE_URL", "https://cn.bing.com/search"),
             "browser_search_market": source.get("BROWSER_SEARCH_MARKET", "zh-CN"),
             "browser_search_engines": _to_list(
                 source.get("BROWSER_SEARCH_ENGINES"),
                 ["bing", "baidu", "google"],
             ),
-            "baidu_search_base_url": source.get("BAIDU_SEARCH_BASE_URL", "https://m.baidu.com/s"),
+            "baidu_search_base_url": source.get("BAIDU_SEARCH_BASE_URL", "https://www.baidu.com/baidu"),
             "google_search_base_url": source.get("GOOGLE_SEARCH_BASE_URL", "https://www.google.com/search"),
             "browser_search_timeout_seconds": _to_float(source.get("BROWSER_SEARCH_TIMEOUT_SECONDS"), 8.0),
             "browser_content_timeout_seconds": _to_float(source.get("BROWSER_CONTENT_TIMEOUT_SECONDS"), 3.0),
@@ -189,6 +211,10 @@ class Settings(BaseModel):
                 source.get("BRIEFING_PLANNING_TIMEOUT_SECONDS"),
                 40.0,
             ),
+            "briefing_synthesis_timeout_seconds": _to_float(
+                source.get("BRIEFING_SYNTHESIS_TIMEOUT_SECONDS"),
+                120.0,
+            ),
             "deepseek_timeout_seconds": _to_float(source.get("DEEPSEEK_TIMEOUT_SECONDS"), 60.0),
             "briefing_max_queries": _to_int(source.get("BRIEFING_MAX_QUERIES"), 28),
             "briefing_results_per_query": _to_int(source.get("BRIEFING_RESULTS_PER_QUERY"), 10),
@@ -196,5 +222,11 @@ class Settings(BaseModel):
             "briefing_model_max_sources": _to_int(source.get("BRIEFING_MODEL_MAX_SOURCES"), 12),
             "briefing_timezone": source.get("BRIEFING_TIMEZONE", "Asia/Shanghai"),
             "admin_user_ids": _to_list(source.get("SEARCH_ASSISTANT_ADMIN_USER_IDS"), []),
+            "embedding_enabled": _to_bool(source.get("SEARCH_ASSISTANT_EMBEDDING_ENABLED"), default=True),
+            "openai_api_key": source.get("OPENAI_API_KEY") or source.get("DEEPSEEK_API_KEY") or None,
+            "openai_base_url": source.get("OPENAI_BASE_URL")
+            or source.get("DEEPSEEK_BASE_URL")
+            or "https://api.openai.com/v1",
+            "openai_embedding_model": source.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
         }
         return cls(**values)

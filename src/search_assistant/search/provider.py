@@ -5,6 +5,8 @@ import html
 import json
 import os
 import re
+import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -18,7 +20,7 @@ from threading import Lock
 from typing import Any, Protocol
 
 from search_assistant.config import Settings
-from search_assistant.contracts import SourceEvidence
+from search_assistant.contracts import ProviderTraceEvent, SourceEvidence
 
 
 SearchResult = SourceEvidence
@@ -32,6 +34,12 @@ class SearchClient(Protocol):
 
 class SearchProviderError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class SearchOutcome:
+    results: list[SearchResult]
+    provider_events: list[ProviderTraceEvent]
 
 
 @dataclass(frozen=True)
@@ -63,25 +71,52 @@ class McpSearchClient:
         self._call_lock = Lock()
 
     def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        return self.search_with_events(query, limit=limit).results
+
+    def search_with_events(self, query: str, limit: int = 5) -> SearchOutcome:
         with self._call_lock:
-            return _run_async_from_sync(lambda: self._search_async(query, limit))
+            return _run_async_from_sync(lambda: self._search_async_with_events(query, limit))
 
     async def _search_async(self, query: str, limit: int) -> list[SearchResult]:
+        return (await self._search_async_with_events(query, limit)).results
+
+    async def _search_async_with_events(self, query: str, limit: int) -> SearchOutcome:
         merged: list[SearchResult] = []
         seen: set[str] = set()
+        provider_events: list[ProviderTraceEvent] = []
         scoped_domains = _site_domains(query)
         for binding in self.bindings:
+            provider = f"mcp:{binding.name}"
             if scoped_domains and not _binding_supports_scoped_domains(binding, scoped_domains):
+                provider_events.append(
+                    _provider_event(
+                        provider=provider,
+                        query=query,
+                        status="skipped",
+                        reason="site_query_not_bound_to_mcp_source",
+                    )
+                )
                 continue
+            started = time.monotonic()
             try:
                 payload = _materialize_mcp_arguments(binding.argument_template, query, limit)
                 raw_result = await asyncio.wait_for(
                     binding.toolset.direct_call_tool(binding.tool_name, payload),
                     timeout=self.timeout_seconds,
                 )
-            except Exception:
+            except Exception as exc:
+                provider_events.append(
+                    _provider_event(
+                        provider=provider,
+                        query=query,
+                        status="error",
+                        error=_safe_provider_error(exc),
+                        elapsed_ms=_elapsed_ms(started),
+                    )
+                )
                 continue
 
+            binding_results: list[SearchResult] = []
             for result in _mcp_results_to_search_results(raw_result, binding.name):
                 if scoped_domains and not _matches_scoped_domains(result.url, scoped_domains):
                     continue
@@ -89,10 +124,29 @@ class McpSearchClient:
                 if key in seen:
                     continue
                 seen.add(key)
+                binding_results.append(result)
                 merged.append(result)
                 if len(merged) >= limit:
-                    return merged
-        return merged
+                    provider_events.append(
+                        _provider_event(
+                            provider=provider,
+                            query=query,
+                            status="success",
+                            result_count=len(binding_results),
+                            elapsed_ms=_elapsed_ms(started),
+                        )
+                    )
+                    return SearchOutcome(merged, provider_events)
+            provider_events.append(
+                _provider_event(
+                    provider=provider,
+                    query=query,
+                    status="success" if binding_results else "empty",
+                    result_count=len(binding_results),
+                    elapsed_ms=_elapsed_ms(started),
+                )
+            )
+        return SearchOutcome(merged, provider_events)
 
     def health(self) -> dict[str, object]:
         return {
@@ -164,14 +218,104 @@ class CompositeSearchClient:
         self.primary_sufficient_results = primary_sufficient_results
 
     def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        return self.search_with_events(query, limit=limit).results
+
+    def search_with_events(self, query: str, limit: int = 5) -> SearchOutcome:
         merged: list[SearchResult] = []
         seen: set[str] = set()
+        provider_events: list[ProviderTraceEvent] = []
         for index, client in enumerate(self.clients):
-            try:
-                candidates = client.search(query, limit=limit)
-            except Exception:
-                continue
+            outcome = search_with_provider_events(client, query, limit=limit)
+            provider_events.extend(outcome.provider_events)
+            candidates = outcome.results
             for result in candidates:
+                key = _dedupe_key(result.url)
+                if key in seen:
+                    provider_events.append(
+                        _provider_event(
+                            provider=result.provider,
+                            query=query,
+                            status="skipped",
+                            result_count=0,
+                            reason="duplicate_url",
+                        )
+                    )
+                    continue
+                seen.add(key)
+                merged.append(result)
+                if len(merged) >= limit:
+                    return SearchOutcome(merged, provider_events)
+            if index == 0 and self.primary_sufficient_results is not None:
+                if len(merged) >= min(limit, self.primary_sufficient_results):
+                    provider_events.append(
+                        _provider_event(
+                            provider="composite",
+                            query=query,
+                            status="skipped",
+                            result_count=len(merged),
+                            reason="primary_sufficient_results",
+                        )
+                    )
+                    return SearchOutcome(merged, provider_events)
+        return SearchOutcome(merged, provider_events)
+
+
+AgentReachCommandRunner = Callable[[list[str], float], str]
+
+
+class AgentReachSearchClient:
+    """Delegates retrieval to the installed Agent Reach capability router.
+
+    Agent Reach is intentionally a CLI capability layer rather than a Python
+    search SDK.  This adapter therefore first runs ``agent-reach doctor
+    --json`` and then calls the read-only command selected by Agent Reach's
+    public routing contract, such as ``mcporter`` for Exa search, ``bili`` for
+    Bilibili, ``yt-dlp`` for YouTube, and ``opencli`` for login-state
+    platforms.
+    """
+
+    def __init__(
+        self,
+        command: str = "agent-reach",
+        timeout_seconds: float = 30.0,
+        doctor_cache_seconds: float = 300.0,
+        command_runner: AgentReachCommandRunner | None = None,
+        require_available: bool = True,
+    ):
+        self.command = command
+        self.timeout_seconds = timeout_seconds
+        self.doctor_cache_seconds = doctor_cache_seconds
+        self.command_runner = command_runner or self._run_subprocess
+        self.require_available = require_available
+        self._doctor_cache: dict[str, Any] | None = None
+        self._doctor_checked_at = 0.0
+
+    def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        if limit <= 0:
+            return []
+
+        doctor = self._doctor()
+        commands = self._commands_for_query(query, limit, doctor)
+        if not commands:
+            message = _agent_reach_unavailable_message(query, doctor)
+            if self.require_available:
+                raise SearchProviderError(message)
+            return []
+
+        checked_at = datetime.now(UTC).isoformat()
+        merged: list[SearchResult] = []
+        seen: set[str] = set()
+        scoped_domains = _site_domains(query)
+        errors: list[str] = []
+        for command, provider in commands:
+            try:
+                raw_output = self.command_runner(command, self.timeout_seconds)
+            except Exception as exc:
+                errors.append(f"{provider}: {exc}")
+                continue
+            for result in _agent_reach_output_to_search_results(raw_output, provider, checked_at):
+                if scoped_domains and not _matches_scoped_domains(result.url, scoped_domains):
+                    continue
                 key = _dedupe_key(result.url)
                 if key in seen:
                     continue
@@ -179,10 +323,223 @@ class CompositeSearchClient:
                 merged.append(result)
                 if len(merged) >= limit:
                     return merged
-            if index == 0 and self.primary_sufficient_results is not None:
-                if len(merged) >= min(limit, self.primary_sufficient_results):
-                    return merged
+
+        if not merged and self.require_available and errors:
+            raise SearchProviderError("Agent Reach commands returned no usable URLs: " + "; ".join(errors[:3]))
         return merged
+
+    def health(self) -> dict[str, object]:
+        doctor = self._doctor()
+        active = {
+            channel: result.get("active_backend")
+            for channel, result in doctor.items()
+            if isinstance(result, dict) and result.get("active_backend")
+        }
+        return {"command": self.command, "active_backends": active}
+
+    def _doctor(self) -> dict[str, Any]:
+        now = time.monotonic()
+        if self._doctor_cache is not None and now - self._doctor_checked_at <= self.doctor_cache_seconds:
+            return self._doctor_cache
+
+        try:
+            raw_output = self.command_runner([self.command, "doctor", "--json"], self.timeout_seconds)
+        except FileNotFoundError as exc:
+            raise SearchProviderError(
+                "Agent Reach CLI was not found. Install it from "
+                "https://github.com/Panniantong/Agent-Reach and keep "
+                "SEARCH_ASSISTANT_SEARCH_PROVIDER=agent-reach only on machines that have it."
+            ) from exc
+        except Exception as exc:
+            raise SearchProviderError(f"Agent Reach doctor failed: {exc}") from exc
+
+        try:
+            parsed = json.loads(raw_output)
+        except json.JSONDecodeError as exc:
+            raise SearchProviderError("Agent Reach doctor did not return valid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise SearchProviderError("Agent Reach doctor JSON must be an object")
+
+        self._doctor_cache = parsed
+        self._doctor_checked_at = now
+        return parsed
+
+    def _commands_for_query(
+        self,
+        query: str,
+        limit: int,
+        doctor: Mapping[str, Any],
+    ) -> list[tuple[list[str], str]]:
+        commands: list[tuple[list[str], str]] = []
+        clean_query = _query_without_site_directives(query) or query
+        scoped_domains = _site_domains(query)
+
+        for channel in _agent_reach_channels_for_domains(scoped_domains):
+            commands.extend(self._commands_for_channel(channel, clean_query, limit, doctor))
+
+        if not scoped_domains or not commands:
+            commands.extend(self._commands_for_channel("exa_search", query, limit, doctor))
+        elif _agent_reach_channel_available(doctor, "exa_search"):
+            # Keep Exa as the final Agent Reach fallback for scoped public
+            # searches.  The original site: directive remains in the query so
+            # the downstream URL-domain guard can still enforce scope.
+            commands.extend(self._commands_for_channel("exa_search", query, limit, doctor))
+
+        unique: list[tuple[list[str], str]] = []
+        seen: set[tuple[str, ...]] = set()
+        for command, provider in commands:
+            key = tuple(command)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append((command, provider))
+        return unique
+
+    def _commands_for_channel(
+        self,
+        channel: str,
+        query: str,
+        limit: int,
+        doctor: Mapping[str, Any],
+    ) -> list[tuple[list[str], str]]:
+        if not _agent_reach_channel_available(doctor, channel):
+            return []
+
+        active_backend = _agent_reach_active_backend(doctor, channel).lower()
+        limit_text = str(max(1, limit))
+
+        if channel == "exa_search":
+            return [
+                (
+                    ["mcporter", "call", "exa.web_search_exa", f"query={query}", f"numResults={limit_text}"],
+                    "agent-reach:exa_search:mcporter",
+                )
+            ]
+        if channel == "github":
+            return [
+                (
+                    ["gh", "search", "repos", query, "--limit", limit_text, "--json", "fullName,description,url"],
+                    "agent-reach:github:gh",
+                )
+            ]
+        if channel == "youtube":
+            return [
+                (
+                    ["yt-dlp", "--dump-json", f"ytsearch{limit_text}:{query}"],
+                    "agent-reach:youtube:yt-dlp",
+                )
+            ]
+        if channel == "bilibili":
+            if "bili-cli" in active_backend:
+                return [
+                    (
+                        ["bili", "search", query, "--type", "video", "-n", limit_text],
+                        "agent-reach:bilibili:bili-cli",
+                    )
+                ]
+            if "opencli" in active_backend:
+                return [
+                    (
+                        ["opencli", "bilibili", "search", query, "-f", "yaml"],
+                        "agent-reach:bilibili:opencli",
+                    )
+                ]
+            return [
+                (
+                    ["curl", "-s", "-A", _AGENT_REACH_BROWSER_UA, _agent_reach_bilibili_search_api_url(query)],
+                    "agent-reach:bilibili:search-api",
+                )
+            ]
+        if channel == "twitter":
+            if "opencli" in active_backend:
+                return [
+                    (
+                        ["opencli", "twitter", "search", query, "-f", "yaml"],
+                        "agent-reach:twitter:opencli",
+                    )
+                ]
+            return [
+                (
+                    ["twitter", "search", query, "-n", limit_text],
+                    "agent-reach:twitter:twitter-cli",
+                )
+            ]
+        if channel == "reddit":
+            if "rdt" in active_backend:
+                return [
+                    (
+                        ["rdt", "search", query, "--limit", limit_text],
+                        "agent-reach:reddit:rdt-cli",
+                    )
+                ]
+            return [
+                (
+                    ["opencli", "reddit", "search", query, "-f", "yaml"],
+                    "agent-reach:reddit:opencli",
+                )
+            ]
+        if channel == "xiaohongshu":
+            if "xiaohongshu-mcp" in active_backend:
+                return [
+                    (
+                        [
+                            "mcporter",
+                            "call",
+                            "xiaohongshu.search_feeds",
+                            f"keyword={query}",
+                            "--timeout",
+                            "120000",
+                        ],
+                        "agent-reach:xiaohongshu:mcp",
+                    )
+                ]
+            if "xhs-cli" in active_backend or active_backend == "xhs":
+                return [(["xhs", "search", query], "agent-reach:xiaohongshu:xhs-cli")]
+            return [
+                (
+                    ["opencli", "xiaohongshu", "search", query, "-f", "yaml"],
+                    "agent-reach:xiaohongshu:opencli",
+                )
+            ]
+        if channel in {"facebook", "instagram"}:
+            return [
+                (
+                    ["opencli", channel, "search", query, "-f", "yaml"],
+                    f"agent-reach:{channel}:opencli",
+                )
+            ]
+        if channel == "linkedin":
+            # Agent Reach currently exposes LinkedIn primarily through MCP or
+            # Jina Reader for known pages.  For query-style retrieval, route
+            # through Agent Reach's Exa search while preserving site scope.
+            return self._commands_for_channel("exa_search", f"site:linkedin.com {query}", limit, doctor)
+        return []
+
+    @staticmethod
+    def _run_subprocess(command: list[str], timeout_seconds: float) -> str:
+        import shutil
+
+        # Windows: CreateProcess cannot execute npm-style .cmd/.bat shims
+        # directly (mcporter installed via `npm install -g` ships only
+        # mcporter.cmd / mcporter.ps1).  Resolve the command and delegate
+        # script shims to cmd.exe so the subprocess actually runs.
+        if os.name == "nt" and command:
+            resolved = shutil.which(command[0])
+            if resolved and resolved.lower().endswith((".cmd", ".bat")):
+                command = ["cmd.exe", "/c", *command]
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+            check=False,
+        )
+        if completed.returncode != 0:
+            output = (completed.stderr or completed.stdout or "").strip()
+            raise SearchProviderError(output or f"Command exited with status {completed.returncode}")
+        return completed.stdout
 
 
 class BrowserSearchClient:
@@ -214,16 +571,44 @@ class BrowserSearchClient:
         )
 
     def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        return self.search_with_events(query, limit=limit).results
+
+    def search_with_events(self, query: str, limit: int = 5) -> SearchOutcome:
+        provider_events: list[ProviderTraceEvent] = []
         scoped_domains = _site_domains(query)
-        supplemental_results = [] if self._requires_baidu_only(scoped_domains) else self._supplemental_results(query, limit)
+        supplemental_results: list[SearchResult] = []
+        if self._requires_baidu_only(scoped_domains):
+            provider_events.append(
+                _provider_event(
+                    provider="browser-supplemental",
+                    query=query,
+                    status="skipped",
+                    reason="baidu_only_scoped_query",
+                )
+            )
+        else:
+            supplemental_start = time.monotonic()
+            supplemental_results = self._supplemental_results(query, limit)
+            provider_events.append(
+                _provider_event(
+                    provider="browser-supplemental",
+                    query=query,
+                    status="success" if supplemental_results else "empty",
+                    result_count=len(supplemental_results),
+                    elapsed_ms=_elapsed_ms(supplemental_start),
+                )
+            )
         merged = self._filter_scoped_results(supplemental_results, scoped_domains)
-        merged.extend(self._scoped_results(query, scoped_domains, limit))
+        scoped_results, scoped_events = self._scoped_results_with_events(query, scoped_domains, limit)
+        provider_events.extend(scoped_events)
+        merged.extend(scoped_results)
         merged = self._dedupe_results(merged, limit)
         seen = {_dedupe_key(result.url) for result in merged}
         if len(merged) >= limit:
-            return merged[:limit]
+            return SearchOutcome(merged[:limit], provider_events)
 
-        engine_results = self._search_engines(query, limit)
+        engine_results, engine_events = self._search_engines_with_events(query, limit)
+        provider_events.extend(engine_events)
 
         max_length = max((len(results) for results in engine_results), default=0)
         for index in range(max_length):
@@ -239,23 +624,63 @@ class BrowserSearchClient:
                 seen.add(key)
                 merged.append(result)
                 if len(merged) >= limit:
-                    return self._enrich_results(query, merged)
-        return self._enrich_results(query, merged)
+                    return SearchOutcome(self._enrich_results(query, merged), provider_events)
+        return SearchOutcome(self._enrich_results(query, merged), provider_events)
 
     def _scoped_results(self, query: str, scoped_domains: tuple[str, ...], limit: int) -> list[SearchResult]:
+        results, _ = self._scoped_results_with_events(query, scoped_domains, limit)
+        return results
+
+    def _scoped_results_with_events(
+        self,
+        query: str,
+        scoped_domains: tuple[str, ...],
+        limit: int,
+    ) -> tuple[list[SearchResult], list[ProviderTraceEvent]]:
         results: list[SearchResult] = []
+        provider_events: list[ProviderTraceEvent] = []
         for domain in scoped_domains:
             client = self.scoped_search_clients.get(domain)
             if client is None:
+                provider_events.append(
+                    _provider_event(
+                        provider=f"scoped:{domain}",
+                        query=query,
+                        status="skipped",
+                        reason="no_explicit_scoped_client",
+                    )
+                )
                 continue
+            started = time.monotonic()
             try:
                 candidates = client.search(query, limit=limit)
-            except Exception:
+            except Exception as exc:
+                provider_events.append(
+                    _provider_event(
+                        provider=_client_provider_name(client),
+                        query=query,
+                        status="error",
+                        reason="scoped_client_error",
+                        error=_safe_provider_error(exc),
+                        elapsed_ms=_elapsed_ms(started),
+                    )
+                )
                 continue
-            results.extend(result for result in candidates if _matches_scoped_domains(result.url, (domain,)))
+            scoped = [result for result in candidates if _matches_scoped_domains(result.url, (domain,))]
+            provider_events.append(
+                _provider_event(
+                    provider=_client_provider_name(client),
+                    query=query,
+                    status="success" if scoped else "empty",
+                    result_count=len(scoped),
+                    reason=None if scoped else "no_on_domain_results",
+                    elapsed_ms=_elapsed_ms(started),
+                )
+            )
+            results.extend(scoped)
             if len(results) >= limit:
                 break
-        return results[:limit]
+        return results[:limit], provider_events
 
     @staticmethod
     def _filter_scoped_results(results: list[SearchResult], scoped_domains: tuple[str, ...]) -> list[SearchResult]:
@@ -614,16 +1039,115 @@ class BrowserSearchClient:
         )
 
     def _search_engines(self, query: str, limit: int) -> list[list[SearchResult]]:
+        results, _ = self._search_engines_with_events(query, limit)
+        return results
+
+    def _search_engines_with_events(
+        self,
+        query: str,
+        limit: int,
+    ) -> tuple[list[list[SearchResult]], list[ProviderTraceEvent]]:
+        scoped_domains = _site_domains(query)
         engines = self.engines
-        if self._requires_baidu_only(_site_domains(query)):
+        if self._requires_baidu_only(scoped_domains):
             engines = [engine for engine in engines if isinstance(engine, BaiduBrowserSearchClient)]
         if not engines:
-            return []
+            return [], [
+                _provider_event(
+                    provider="browser-engines",
+                    query=query,
+                    status="skipped",
+                    reason="no_enabled_engine_for_query",
+                )
+            ]
 
+        executor = ThreadPoolExecutor(max_workers=len(engines))
+        started_at = {engine: time.monotonic() for engine in engines}
+        futures = [(engine, executor.submit(engine.search, query, limit)) for engine in engines]
+        wait([future for _, future in futures], timeout=self.engine_timeout_seconds)
+
+        engine_results: list[list[SearchResult]] = []
+        provider_events: list[ProviderTraceEvent] = []
+        for engine, future in futures:
+            provider = _client_provider_name(engine)
+            started = started_at[engine]
+            if not future.done():
+                future.cancel()
+                engine_results.append([])
+                provider_events.append(
+                    _provider_event(
+                        provider=provider,
+                        query=query,
+                        status="timeout",
+                        reason=f"exceeded_{self.engine_timeout_seconds:g}s_budget",
+                        elapsed_ms=_elapsed_ms(started),
+                    )
+                )
+                continue
+            try:
+                results = future.result()
+            except Exception as exc:
+                engine_results.append([])
+                provider_events.append(
+                    _provider_event(
+                        provider=provider,
+                        query=query,
+                        status="error",
+                        error=_safe_provider_error(exc),
+                        elapsed_ms=_elapsed_ms(started),
+                    )
+                )
+                continue
+            engine_results.append(results)
+            provider_events.append(
+                _provider_event(
+                    provider=provider,
+                    query=query,
+                    status="success" if results else "empty",
+                    result_count=len(results),
+                    elapsed_ms=_elapsed_ms(started),
+                )
+            )
+        executor.shutdown(wait=False, cancel_futures=True)
+
+        if scoped_domains and not self._has_scoped_engine_results(engine_results, scoped_domains):
+            fallback_engines = self.engines
+            if self._requires_baidu_only(scoped_domains):
+                fallback_engines = [
+                    engine for engine in self.engines if not isinstance(engine, BaiduBrowserSearchClient)
+                ]
+            engine_results.extend(
+                self._scoped_query_fallback_results(
+                    fallback_engines,
+                    query,
+                    scoped_domains,
+                    limit,
+                )
+            )
+        return engine_results, provider_events
+
+    @staticmethod
+    def _has_scoped_engine_results(
+        engine_results: list[list[SearchResult]],
+        scoped_domains: tuple[str, ...],
+    ) -> bool:
+        return any(
+            _matches_scoped_domains(result.url, scoped_domains)
+            for results in engine_results
+            for result in results
+        )
+
+    def _search_with_engines(
+        self,
+        engines: list[SearchClient],
+        query: str,
+        limit: int,
+    ) -> list[list[SearchResult]]:
+        if not engines:
+            return []
         executor = ThreadPoolExecutor(max_workers=len(engines))
         futures = [executor.submit(engine.search, query, limit) for engine in engines]
         wait(futures, timeout=self.engine_timeout_seconds)
-
         engine_results: list[list[SearchResult]] = []
         for future in futures:
             if not future.done():
@@ -636,6 +1160,21 @@ class BrowserSearchClient:
                 engine_results.append([])
         executor.shutdown(wait=False, cancel_futures=True)
         return engine_results
+
+    def _scoped_query_fallback_results(
+        self,
+        engines: list[SearchClient],
+        query: str,
+        scoped_domains: tuple[str, ...],
+        limit: int,
+    ) -> list[list[SearchResult]]:
+        fallback_results: list[list[SearchResult]] = []
+        for fallback_query in _scoped_query_fallbacks(query, scoped_domains):
+            engine_results = self._search_with_engines(engines, fallback_query, limit)
+            fallback_results.extend(engine_results)
+            if self._has_scoped_engine_results(engine_results, scoped_domains):
+                break
+        return fallback_results
 
     def _enrich_results(self, query: str, results: list[SearchResult]) -> list[SearchResult]:
         if not self.enrich_content or self._requires_baidu_only(_site_domains(query)):
@@ -735,30 +1274,65 @@ class BingBrowserSearchClient:
 class BaiduBrowserSearchClient:
     def __init__(
         self,
-        base_url: str = "https://m.baidu.com/s",
+        base_url: str = "https://www.baidu.com/baidu",
         transport: SearchTransport | None = None,
+        fallback_base_urls: Iterable[str] | None = None,
+        request_interval_seconds: float = 0.0,
+        challenge_cooldown_seconds: float = 0.0,
     ):
         self.base_url = base_url
         self.transport = transport or _urllib_get
+        self.fallback_base_urls = tuple(
+            fallback_base_urls
+            if fallback_base_urls is not None
+            else ("https://www.baidu.com/baidu", "https://m.baidu.com/s", "https://www.baidu.com/s")
+        )
+        self.request_interval_seconds = max(0.0, request_interval_seconds)
+        self.challenge_cooldown_seconds = max(0.0, challenge_cooldown_seconds)
+        self._request_lock = Lock()
+        self._next_request_at = 0.0
+        self._blocked_until = 0.0
 
     def search(self, query: str, limit: int = 5) -> list[SearchResult]:
-        host = _normalize_domain(urllib.parse.urlparse(self.base_url).hostname or "")
-        parameters = {"word": query} if host == "m.baidu.com" else {"wd": query, "ie": "utf-8"}
-        url = self.base_url + "?" + urllib.parse.urlencode(parameters)
-        html_body = self.transport(
-            url,
-            {
-                "User-Agent": (
-                    "Mozilla/5.0 (Linux; Android 14; Pixel 7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36"
-                ),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
-            },
-        )
-        if _is_baidu_challenge_page(html_body):
-            raise SearchProviderError("Baidu public search returned a verification page")
-        return self.parse_results(html_body, checked_at=datetime.now(UTC).isoformat())[:limit]
+        last_error: SearchProviderError | None = None
+        for base_url in _unique_urls((self.base_url, *self.fallback_base_urls)):
+            url = _baidu_search_url(base_url, query)
+            try:
+                html_body = self._rate_limited_get(url, _baidu_page_headers(base_url))
+            except SearchProviderError as exc:
+                last_error = exc
+                continue
+            if _is_baidu_challenge_page(html_body):
+                last_error = SearchProviderError("Baidu public search returned a verification page")
+                continue
+            results = self.parse_results(html_body, checked_at=datetime.now(UTC).isoformat())
+            if results:
+                return results[:limit]
+        if last_error is not None:
+            if "verification page" in str(last_error):
+                self._mark_challenge_cooldown()
+            raise last_error
+        return []
+
+    def _rate_limited_get(self, url: str, headers: dict[str, str]) -> str:
+        with self._request_lock:
+            if self._blocked_until > time.monotonic():
+                raise SearchProviderError("Baidu public search is cooling down after a verification page")
+            if self.request_interval_seconds <= 0:
+                return self.transport(url, headers)
+            wait_seconds = self._next_request_at - time.monotonic()
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            try:
+                return self.transport(url, headers)
+            finally:
+                self._next_request_at = time.monotonic() + self.request_interval_seconds
+
+    def _mark_challenge_cooldown(self) -> None:
+        if self.challenge_cooldown_seconds <= 0:
+            return
+        with self._request_lock:
+            self._blocked_until = max(self._blocked_until, time.monotonic() + self.challenge_cooldown_seconds)
 
     @staticmethod
     def parse_results(html_body: str, checked_at: str) -> list[SearchResult]:
@@ -989,9 +1563,13 @@ class BilibiliPublicSearchClient:
         self,
         base_url: str = "https://api.bilibili.com/x/web-interface/search/type",
         transport: SearchTransport | None = None,
+        request_interval_seconds: float = 0.0,
     ):
         self.base_url = base_url.rstrip("/")
         self.transport = transport or _urllib_get
+        self.request_interval_seconds = max(0.0, request_interval_seconds)
+        self._request_lock = Lock()
+        self._next_request_at = 0.0
 
     def search(self, query: str, limit: int = 5) -> list[SearchResult]:
         keyword = _query_without_site_directives(query)
@@ -1000,15 +1578,28 @@ class BilibiliPublicSearchClient:
         url = self.base_url + "?" + urllib.parse.urlencode(
             {"search_type": "video", "keyword": keyword, "page": "1"}
         )
-        payload = self.transport(
-            url,
-            {
-                "User-Agent": "Mozilla/5.0 search-assistant/0.1",
-                "Accept": "application/json",
-                "Referer": "https://search.bilibili.com/",
-            },
-        )
-        return self.parse_results(payload, checked_at=datetime.now(UTC).isoformat())[:limit]
+        last_error: SearchProviderError | None = None
+        for headers in _bilibili_api_headers():
+            try:
+                payload = self._rate_limited_get(url, headers)
+                return self.parse_results(payload, checked_at=datetime.now(UTC).isoformat())[:limit]
+            except SearchProviderError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        return []
+
+    def _rate_limited_get(self, url: str, headers: dict[str, str]) -> str:
+        if self.request_interval_seconds <= 0:
+            return self.transport(url, headers)
+        with self._request_lock:
+            wait_seconds = self._next_request_at - time.monotonic()
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            try:
+                return self.transport(url, headers)
+            finally:
+                self._next_request_at = time.monotonic() + self.request_interval_seconds
 
     @staticmethod
     def parse_results(payload: str, checked_at: str) -> list[SearchResult]:
@@ -1052,6 +1643,150 @@ class BilibiliPublicSearchClient:
         return results
 
 
+class ToutiaoPublicSearchClient:
+    """No-login Toutiao public search page parser for routes explicitly scoped to toutiao.com."""
+
+    def __init__(
+        self,
+        base_url: str = "https://so.toutiao.com/search",
+        transport: SearchTransport | None = None,
+        request_interval_seconds: float = 0.0,
+    ):
+        self.base_url = base_url
+        self.transport = transport or _urllib_get
+        self.request_interval_seconds = max(0.0, request_interval_seconds)
+        self._request_lock = Lock()
+        self._next_request_at = 0.0
+
+    def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        keyword = _query_without_site_directives(query)
+        if not keyword:
+            return []
+        url = self.base_url + "?" + urllib.parse.urlencode({"keyword": keyword})
+        html_body = self._rate_limited_get(
+            url,
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0"
+                ),
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+            },
+        )
+        return self.parse_results(html_body, checked_at=datetime.now(UTC).isoformat())[:limit]
+
+    def _rate_limited_get(self, url: str, headers: dict[str, str]) -> str:
+        if self.request_interval_seconds <= 0:
+            return self.transport(url, headers)
+        with self._request_lock:
+            wait_seconds = self._next_request_at - time.monotonic()
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            try:
+                return self.transport(url, headers)
+            finally:
+                self._next_request_at = time.monotonic() + self.request_interval_seconds
+
+    @staticmethod
+    def parse_results(html_body: str, checked_at: str) -> list[SearchResult]:
+        results: list[SearchResult] = []
+        url_pattern = re.compile(
+            r'(?:open_url|article_url)(?:&quot;|["\'])\s*:\s*(?:&quot;|["\'])(?P<url>.*?)(?:&quot;|["\'])',
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        matches = list(url_pattern.finditer(html_body))
+        for index, match in enumerate(matches):
+            url = _decode_embedded_json_value(match.group("url"))
+            url = html.unescape(url).replace("\\/", "/").strip()
+            url = _canonical_toutiao_url(url)
+            if not url:
+                continue
+            next_start = matches[index + 1].start() if index + 1 < len(matches) else min(len(html_body), match.end() + 6000)
+            window = html_body[max(0, match.start() - 2500) : next_start]
+            title = _extract_embedded_json_field(window, ("title", "display_title")) or url
+            snippet = _extract_embedded_json_field(window, ("abstract", "summary", "hot_board_summary"))
+            results.append(
+                SearchResult(
+                    title=_clean_text(_strip_tags(title)),
+                    url=url,
+                    snippet=_clean_text(_strip_tags(snippet)),
+                    provider="toutiao-public-search",
+                    checked_at=checked_at,
+                )
+            )
+        return _dedupe_search_results(results)
+
+
+class YouTubePublicSearchClient:
+    """No-login YouTube search page parser for routes explicitly scoped to youtube.com."""
+
+    def __init__(
+        self,
+        base_url: str = "https://www.youtube.com/results",
+        transport: SearchTransport | None = None,
+        request_interval_seconds: float = 0.0,
+    ):
+        self.base_url = base_url
+        self.transport = transport or _urllib_get
+        self.request_interval_seconds = max(0.0, request_interval_seconds)
+        self._request_lock = Lock()
+        self._next_request_at = 0.0
+
+    def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        keyword = _query_without_site_directives(query)
+        if not keyword:
+            return []
+        url = self.base_url + "?" + urllib.parse.urlencode({"search_query": keyword})
+        html_body = self._rate_limited_get(
+            url,
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0"
+                ),
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "en-US,en;q=0.9,zh;q=0.6",
+            },
+        )
+        return self.parse_results(html_body, checked_at=datetime.now(UTC).isoformat())[:limit]
+
+    def _rate_limited_get(self, url: str, headers: dict[str, str]) -> str:
+        if self.request_interval_seconds <= 0:
+            return self.transport(url, headers)
+        with self._request_lock:
+            wait_seconds = self._next_request_at - time.monotonic()
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            try:
+                return self.transport(url, headers)
+            finally:
+                self._next_request_at = time.monotonic() + self.request_interval_seconds
+
+    @staticmethod
+    def parse_results(html_body: str, checked_at: str) -> list[SearchResult]:
+        results: list[SearchResult] = []
+        pattern = re.compile(
+            r'"videoId":"(?P<video_id>[^"]+)".{0,5000}?"title":\{"runs":\[\{"text":"(?P<title>.*?)"\}',
+            flags=re.DOTALL,
+        )
+        for match in pattern.finditer(html_body):
+            video_id = match.group("video_id")
+            title = _decode_embedded_json_value(match.group("title"))
+            if not video_id or not title:
+                continue
+            results.append(
+                SearchResult(
+                    title=_clean_text(title),
+                    url=f"https://www.youtube.com/watch?v={video_id}",
+                    snippet="Public YouTube search result.",
+                    provider="youtube-public-search",
+                    checked_at=checked_at,
+                )
+            )
+        return _dedupe_search_results(results)
+
+
 class DuckDuckGoSearchClient:
     def __init__(self, transport: SearchTransport | None = None, timeout_seconds: float = 12.0):
         self.transport = transport or _urllib_get_with_timeout(timeout_seconds)
@@ -1083,15 +1818,95 @@ class FakeSearchClient:
         return []
 
 
+def search_with_provider_events(client: SearchClient, query: str, limit: int = 5) -> SearchOutcome:
+    traced_search = getattr(client, "search_with_events", None)
+    if callable(traced_search):
+        outcome = traced_search(query, limit=limit)
+        return _screen_injection(outcome, client, query)
+
+    provider = _client_provider_name(client)
+    started = time.monotonic()
+    try:
+        results = client.search(query, limit=limit)
+    except Exception as exc:
+        return SearchOutcome(
+            results=[],
+            provider_events=[
+                _provider_event(
+                    provider=provider,
+                    query=query,
+                    status="error",
+                    error=_safe_provider_error(exc),
+                    elapsed_ms=_elapsed_ms(started),
+                )
+            ],
+        )
+    return _screen_injection(
+        SearchOutcome(
+            results=results,
+            provider_events=[
+                _provider_event(
+                    provider=provider,
+                    query=query,
+                    status="success" if results else "empty",
+                    result_count=len(results),
+                    elapsed_ms=_elapsed_ms(started),
+                )
+            ],
+        ),
+        client,
+        query,
+    )
+
+
+def _screen_injection(outcome: SearchOutcome, client: SearchClient, query: str) -> SearchOutcome:
+    """Drop retrieved sources that carry prompt-injection patterns.
+
+    Screened content is untrusted data, not instructions; matched sources are
+    removed from what reaches the LLM context while a provider event keeps the
+    audit trail.  Applies to every retrieval path (traced and plain).
+    """
+    if not outcome.results:
+        return outcome
+    from search_assistant.search.injection import strip_injected_sources
+
+    clean, flagged = strip_injected_sources(outcome.results)
+    if not flagged:
+        return outcome
+    provider_events = list(outcome.provider_events)
+    provider_events.append(
+        _provider_event(
+            provider=_client_provider_name(client),
+            query=query,
+            status="filtered",
+            result_count=len(flagged),
+            reason="prompt_injection",
+        )
+    )
+    return SearchOutcome(results=clean, provider_events=provider_events)
+
+
 def search_client_from_settings(settings: Settings) -> SearchClient:
     provider = settings.search_provider.lower()
+    if provider == "agent-reach":
+        return _agent_reach_search_client_from_settings(settings)
     if provider == "browser":
         return _browser_search_client_from_settings(settings)
     if provider == "mcp":
         return _mcp_search_client_from_settings(settings)
     if provider == "hybrid":
+        # MCP and browser first; Agent Reach last as a supplementary pass.
+        # Agent Reach routes spawn a subprocess per query (e.g. mcporter for
+        # Exa), so running them first starves the briefing search budget and
+        # the browser engines never get to contribute.
+        clients: list[SearchClient] = [
+            _mcp_search_client_from_settings(settings),
+            _browser_search_client_from_settings(settings),
+        ]
+        if settings.agent_reach_enabled:
+            clients.append(_agent_reach_search_client_from_settings(settings, require_available=False))
         return CompositeSearchClient(
-            [_mcp_search_client_from_settings(settings), _browser_search_client_from_settings(settings)],
+            clients,
             # Public MCP sources provide structured technical evidence, but a
             # small number of results is not enough to represent global and
             # Chinese web coverage. Merge the browser pass before ranking.
@@ -1116,6 +1931,18 @@ def search_client_from_settings(settings: Settings) -> SearchClient:
     raise RuntimeError(f"Unsupported search provider: {settings.search_provider}")
 
 
+def _agent_reach_search_client_from_settings(
+    settings: Settings,
+    require_available: bool = True,
+) -> AgentReachSearchClient:
+    return AgentReachSearchClient(
+        command=settings.agent_reach_command,
+        timeout_seconds=settings.agent_reach_timeout_seconds,
+        doctor_cache_seconds=settings.agent_reach_doctor_cache_seconds,
+        require_available=require_available,
+    )
+
+
 def _browser_search_client_from_settings(settings: Settings) -> BrowserSearchClient:
     return BrowserSearchClient(
         _browser_engines_from_settings(settings),
@@ -1128,7 +1955,16 @@ def _browser_search_client_from_settings(settings: Settings) -> BrowserSearchCli
             "bilibili.com": BilibiliPublicSearchClient(
                 base_url=settings.bilibili_search_base_url,
                 transport=_urllib_get_with_timeout(settings.browser_search_timeout_seconds),
-            )
+                request_interval_seconds=0.5,
+            ),
+            "toutiao.com": ToutiaoPublicSearchClient(
+                transport=_urllib_get_with_timeout(settings.browser_search_timeout_seconds),
+                request_interval_seconds=0.5,
+            ),
+            "youtube.com": YouTubePublicSearchClient(
+                transport=_urllib_get_with_timeout(settings.browser_search_timeout_seconds),
+                request_interval_seconds=0.5,
+            ),
         },
         baidu_only_domains={
             "mp.weixin.qq.com",
@@ -1171,7 +2007,14 @@ def _browser_engines_from_settings(settings: Settings) -> list[SearchClient]:
                 )
             )
         elif engine == "baidu":
-            engines.append(BaiduBrowserSearchClient(base_url=settings.baidu_search_base_url, transport=transport))
+            engines.append(
+                BaiduBrowserSearchClient(
+                    base_url=settings.baidu_search_base_url,
+                    transport=transport,
+                    request_interval_seconds=0.8,
+                    challenge_cooldown_seconds=60.0,
+                )
+            )
         elif engine == "google":
             engines.append(
                 GoogleBrowserSearchClient(
@@ -1180,9 +2023,286 @@ def _browser_engines_from_settings(settings: Settings) -> list[SearchClient]:
                     transport=transport,
                 )
             )
+        elif engine == "duckduckgo":
+            engines.append(DuckDuckGoSearchClient(transport=transport))
         else:
             raise RuntimeError(f"Unsupported browser search engine: {engine}")
     return engines
+
+
+_AGENT_REACH_BROWSER_UA = "Mozilla/5.0 agent-reach/search-assistant"
+
+_AGENT_REACH_DOMAIN_CHANNELS: dict[str, str] = {
+    "github.com": "github",
+    "youtube.com": "youtube",
+    "youtu.be": "youtube",
+    "bilibili.com": "bilibili",
+    "b23.tv": "bilibili",
+    "reddit.com": "reddit",
+    "x.com": "twitter",
+    "twitter.com": "twitter",
+    "xiaohongshu.com": "xiaohongshu",
+    "xhslink.com": "xiaohongshu",
+    "facebook.com": "facebook",
+    "instagram.com": "instagram",
+    "linkedin.com": "linkedin",
+}
+
+
+def _agent_reach_channels_for_domains(scoped_domains: tuple[str, ...]) -> list[str]:
+    channels: list[str] = []
+    for domain in scoped_domains:
+        normalized = _normalize_domain(domain)
+        for configured_domain, channel in _AGENT_REACH_DOMAIN_CHANNELS.items():
+            if normalized == configured_domain or normalized.endswith(f".{configured_domain}"):
+                _append_unique(channels, channel)
+                break
+    return channels
+
+
+def _agent_reach_channel_available(doctor: Mapping[str, Any], channel: str) -> bool:
+    raw_result = doctor.get(channel)
+    if not isinstance(raw_result, dict):
+        return False
+    # Agent Reach may report warn when it deliberately avoids a live platform
+    # read (for example Exa registered in mcporter or OpenCLI present but not
+    # probed).  That is still a real Agent Reach route worth trying.
+    return str(raw_result.get("status", "")).lower() in {"ok", "warn"}
+
+
+def _agent_reach_active_backend(doctor: Mapping[str, Any], channel: str) -> str:
+    raw_result = doctor.get(channel)
+    if not isinstance(raw_result, dict):
+        return ""
+    return str(raw_result.get("active_backend") or "")
+
+
+def _agent_reach_unavailable_message(query: str, doctor: Mapping[str, Any]) -> str:
+    channels = _agent_reach_channels_for_domains(_site_domains(query)) or ["exa_search"]
+    statuses: list[str] = []
+    for channel in channels:
+        result = doctor.get(channel)
+        if isinstance(result, dict):
+            status = result.get("status", "unknown")
+            message = str(result.get("message") or "").splitlines()[0]
+            statuses.append(f"{channel}={status}: {message}")
+        else:
+            statuses.append(f"{channel}=missing")
+    return "Agent Reach has no usable route for this query. " + "; ".join(statuses)
+
+
+def _agent_reach_bilibili_search_api_url(query: str) -> str:
+    return (
+        "https://api.bilibili.com/x/web-interface/search/all/v2?"
+        + urllib.parse.urlencode({"keyword": query, "page": "1"})
+    )
+
+
+def _agent_reach_output_to_search_results(raw_output: str, provider: str, checked_at: str) -> list[SearchResult]:
+    parsed = _json_loads_maybe(raw_output)
+    results: list[SearchResult] = []
+    if parsed is not None:
+        results.extend(_agent_reach_json_to_search_results(parsed, provider, checked_at))
+    if not results:
+        results.extend(_agent_reach_text_to_search_results(raw_output, provider, checked_at))
+    return _dedupe_search_results(results)
+
+
+def _agent_reach_json_to_search_results(value: Any, provider: str, checked_at: str) -> list[SearchResult]:
+    results: list[SearchResult] = []
+    if isinstance(value, list):
+        for item in value:
+            results.extend(_agent_reach_json_to_search_results(item, provider, checked_at))
+        return results
+
+    if isinstance(value, dict):
+        title = _first_non_empty_string(
+            value,
+            (
+                "title",
+                "name",
+                "fullName",
+                "full_name",
+                "repo",
+                "repository",
+                "author",
+                "username",
+            ),
+        )
+        url = _first_non_empty_string(
+            value,
+            (
+                "url",
+                "html_url",
+                "htmlUrl",
+                "link",
+                "external_url",
+                "externalUrl",
+                "webpage_url",
+                "webpageUrl",
+                "arcurl",
+                "short_link",
+            ),
+        )
+        snippet = _first_non_empty_string(
+            value,
+            (
+                "snippet",
+                "description",
+                "desc",
+                "content",
+                "text",
+                "summary",
+                "body",
+                "dynamic",
+            ),
+        )
+        if url and url.startswith(("http://", "https://")):
+            results.append(
+                SearchResult(
+                    title=_clean_text(title or _title_from_url(url)),
+                    url=html.unescape(url),
+                    snippet=_clean_text(snippet),
+                    provider=provider,
+                    checked_at=checked_at,
+                )
+            )
+
+        for raw_child in value.values():
+            if isinstance(raw_child, str):
+                child_json = _json_loads_maybe(raw_child)
+                if child_json is not None:
+                    results.extend(_agent_reach_json_to_search_results(child_json, provider, checked_at))
+                else:
+                    results.extend(_agent_reach_text_to_search_results(raw_child, provider, checked_at))
+            elif isinstance(raw_child, (dict, list)):
+                results.extend(_agent_reach_json_to_search_results(raw_child, provider, checked_at))
+        return results
+
+    if isinstance(value, str):
+        nested = _json_loads_maybe(value)
+        if nested is not None:
+            return _agent_reach_json_to_search_results(nested, provider, checked_at)
+        return _agent_reach_text_to_search_results(value, provider, checked_at)
+
+    return results
+
+
+def _agent_reach_text_to_search_results(raw_output: str, provider: str, checked_at: str) -> list[SearchResult]:
+    results: list[SearchResult] = []
+    for raw_line in raw_output.splitlines():
+        line = _clean_text(raw_line)
+        if not line:
+            continue
+        for url in _urls_from_text(line):
+            title = _title_from_text_line(line, url)
+            results.append(
+                SearchResult(
+                    title=title,
+                    url=url,
+                    snippet=line,
+                    provider=provider,
+                    checked_at=checked_at,
+                )
+            )
+        for bvid in re.findall(r"\bBV[0-9A-Za-z]{8,}\b", line):
+            url = f"https://www.bilibili.com/video/{bvid}"
+            results.append(
+                SearchResult(
+                    title=_title_from_text_line(line, bvid),
+                    url=url,
+                    snippet=line,
+                    provider=provider,
+                    checked_at=checked_at,
+                )
+            )
+    return results
+
+
+def _json_loads_maybe(value: str) -> Any | None:
+    stripped = value.strip()
+    if not stripped or stripped[0] not in "[{":
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+
+def _first_non_empty_string(values: Mapping[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = values.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, int | float):
+            return str(value)
+    return ""
+
+
+def _urls_from_text(value: str) -> list[str]:
+    urls: list[str] = []
+    for match in re.finditer(r"https?://[^\s\]\)\"'<>，。；、]+", value):
+        url = html.unescape(match.group(0)).rstrip(".,;:!?)】》")
+        if url.startswith(("http://", "https://")):
+            urls.append(url)
+    return urls
+
+
+def _title_from_text_line(line: str, marker: str) -> str:
+    before_marker = line.split(marker, 1)[0].strip(" -|:：[]()")
+    if before_marker:
+        return _clean_text(before_marker)[-120:]
+    if marker.startswith("http"):
+        return _title_from_url(marker)
+    return marker
+
+
+def _title_from_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    host = _normalize_domain(parsed.hostname or "source")
+    path = urllib.parse.unquote(parsed.path.strip("/").split("/")[-1] if parsed.path else "")
+    return _clean_text(path or host)
+def _provider_event(
+    *,
+    provider: str,
+    query: str,
+    status: str,
+    result_count: int = 0,
+    reason: str | None = None,
+    error: str | None = None,
+    elapsed_ms: float | None = None,
+) -> ProviderTraceEvent:
+    return ProviderTraceEvent(
+        provider=provider,
+        query=query,
+        status=status,  # type: ignore[arg-type]
+        result_count=result_count,
+        reason=reason,
+        error=error,
+        elapsed_ms=elapsed_ms,
+        checked_at=datetime.now(UTC).isoformat(),
+    )
+
+
+def _elapsed_ms(started: float) -> float:
+    return round((time.monotonic() - started) * 1000, 3)
+
+
+def _safe_provider_error(exc: Exception, max_chars: int = 240) -> str:
+    text = f"{type(exc).__name__}: {exc}"
+    for marker in ("api_key", "token", "authorization", "secret", "cookie", "key="):
+        text = re.sub(marker, "[redacted]", text, flags=re.IGNORECASE)
+    return text[:max_chars]
+
+
+def _client_provider_name(client: SearchClient) -> str:
+    if isinstance(client, CompositeSearchClient):
+        return "composite"
+    if isinstance(client, BrowserSearchClient):
+        return "browser"
+    if isinstance(client, McpSearchClient):
+        return "mcp"
+    return _browser_engine_name(client)
 
 
 def _browser_engine_name(engine: SearchClient) -> str:
@@ -1192,6 +2312,16 @@ def _browser_engine_name(engine: SearchClient) -> str:
         return "baidu"
     if isinstance(engine, GoogleBrowserSearchClient):
         return "google"
+    if isinstance(engine, DuckDuckGoSearchClient):
+        return "duckduckgo"
+    if isinstance(engine, BraveSearchClient):
+        return "brave"
+    if isinstance(engine, SearxngSearchClient):
+        return "searxng"
+    if isinstance(engine, BilibiliPublicSearchClient):
+        return "bilibili-public-api"
+    if isinstance(engine, FakeSearchClient):
+        return "fake"
     return type(engine).__name__
 
 
@@ -1267,6 +2397,131 @@ def _browser_page_headers() -> dict[str, str]:
         "Accept": "text/html,application/xhtml+xml",
         "Accept-Language": "en-US,en;q=0.9,zh;q=0.6",
     }
+
+
+def _scoped_query_fallbacks(query: str, scoped_domains: tuple[str, ...]) -> list[str]:
+    clean_query = _query_without_site_directives(query)
+    if not clean_query or not scoped_domains:
+        return []
+
+    fallbacks: list[str] = []
+    for domain in scoped_domains:
+        _append_unique(fallbacks, f"{clean_query} {domain}")
+    return [candidate for candidate in fallbacks if candidate != query]
+
+
+def _append_unique(values: list[str], value: str) -> None:
+    normalized = " ".join(value.split())
+    if normalized and normalized.lower() not in {item.lower() for item in values}:
+        values.append(normalized)
+
+
+def _unique_urls(urls: Iterable[str]) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for url in urls:
+        normalized = url.strip().rstrip("/")
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(normalized)
+    return unique
+
+
+def _baidu_search_url(base_url: str, query: str) -> str:
+    host = _normalize_domain(urllib.parse.urlparse(base_url).hostname or "")
+    parameters = {"word": query} if host == "m.baidu.com" else {"wd": query, "ie": "utf-8"}
+    return base_url.rstrip("/") + "?" + urllib.parse.urlencode(parameters)
+
+
+def _baidu_page_headers(base_url: str) -> dict[str, str]:
+    host = _normalize_domain(urllib.parse.urlparse(base_url).hostname or "")
+    if host == "m.baidu.com":
+        return {
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 14; Pixel 7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+        }
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+    }
+
+
+def _bilibili_api_headers() -> list[dict[str, str]]:
+    desktop_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+        "Origin": "https://search.bilibili.com",
+        "Referer": "https://search.bilibili.com/",
+    }
+    return [
+        {
+            "User-Agent": "Mozilla/5.0 search-assistant/0.1",
+            "Accept": "application/json",
+            "Referer": "https://search.bilibili.com/",
+        },
+        desktop_headers,
+    ]
+
+
+def _extract_embedded_json_field(window: str, field_names: tuple[str, ...]) -> str:
+    for field_name in field_names:
+        patterns = (
+            rf'{re.escape(field_name)}(?:&quot;|["\'])\s*:\s*(?:&quot;|["\'])(.*?)(?:&quot;|["\'])',
+            rf'{re.escape(field_name)}\\?"\s*:\s*\\?"(.*?)(?:\\?"|")',
+        )
+        for pattern in patterns:
+            match = re.search(pattern, window, flags=re.DOTALL | re.IGNORECASE)
+            if match:
+                value = _decode_embedded_json_value(match.group(1))
+                if value:
+                    return value
+    return ""
+
+
+def _decode_embedded_json_value(value: str) -> str:
+    unescaped = html.unescape(value).replace("\\/", "/")
+    try:
+        return str(json.loads(f'"{unescaped}"'))
+    except json.JSONDecodeError:
+        return _decode_javascript_escapes(unescaped)
+
+
+def _dedupe_search_results(results: list[SearchResult]) -> list[SearchResult]:
+    unique: list[SearchResult] = []
+    seen: set[str] = set()
+    for result in results:
+        key = _dedupe_key(result.url)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(result)
+    return unique
+
+
+def _canonical_toutiao_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    host = _normalize_domain(parsed.hostname or "")
+    if not _matches_scoped_domains(url, ("toutiao.com",)):
+        return ""
+    if host == "article.zlink.toutiao.com":
+        return ""
+    match = re.match(r"^/(?:group|article)/(\d+)/?", parsed.path)
+    if not match:
+        return ""
+    return f"https://toutiao.com/group/{match.group(1)}"
 
 
 def _extract_relevant_page_excerpt(html_body: str, query: str, max_chars: int = 1200) -> str:
@@ -1513,8 +2768,11 @@ def _mcp_toolset_from_config(
     config_directory: Path,
     timeout_seconds: float,
 ) -> Any:
-    from fastmcp.client.transports import StdioTransport
-    from pydantic_ai.mcp import MCPToolset
+    try:
+        from fastmcp.client.transports import StdioTransport
+        from pydantic_ai.mcp import MCPToolset
+    except ModuleNotFoundError as exc:
+        return _UnavailableMcpToolset(f"MCP dependency is missing: {exc.name}")
 
     expanded_server = _expand_mcp_environment(server)
     raw_url = expanded_server.get("url")
@@ -1557,6 +2815,14 @@ def _mcp_toolset_from_config(
         init_timeout=timeout_seconds,
         read_timeout=timeout_seconds,
     )
+
+
+class _UnavailableMcpToolset:
+    def __init__(self, reason: str):
+        self.reason = reason
+
+    async def direct_call_tool(self, name: str, args: dict[str, object]) -> object:
+        raise SearchProviderError(self.reason)
 
 
 def _expand_mcp_environment(value: object) -> object:
